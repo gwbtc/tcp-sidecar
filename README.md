@@ -49,6 +49,9 @@ cp config.example.json config.json
 # Or manually: rsync -av --delete desk/ /path/to/pier/tcp-sidecar/
 
 # 4. On your ship
+|new-desk %tcp-sidecar
+|mount %tcp-sidecar
+# (sync/rsync files into the mounted desk)
 |commit %tcp-sidecar
 |install our %tcp-sidecar
 
