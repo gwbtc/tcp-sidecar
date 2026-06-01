@@ -1,0 +1,4 @@
+config.json
+sidecar/tcp-sidecar
+sidecar/*.o
+sidecar/ur/*.o
