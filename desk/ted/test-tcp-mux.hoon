@@ -33,7 +33,7 @@
     (strand-fail:strandio %unexpected-gift ~[leaf+"[{who}] got {<-.gif>}"])
   ::
       %receive
-    ~&  ">> [{who}] received {<(met 3 data.gif)>} bytes"
+    ~&  ">> [{who}] received {<p.data.gif>} bytes"
     ?:  is-a
       (mux-loop st(a-data &))
     (mux-loop st(b-data &))
@@ -78,10 +78,10 @@
 ~&  ">> sending HTTP GET on both"
 ;<  ~  bind:m
   %-  poke-our:strandio
-  [%tcp %tcp-task !>(`task:tcp`[%send /a req])]
+  [%tcp %tcp-task !>(`task:tcp`[%send /a [(met 3 req) req]])]
 ;<  ~  bind:m
   %-  poke-our:strandio
-  [%tcp %tcp-task !>(`task:tcp`[%send /b req])]
+  [%tcp %tcp-task !>(`task:tcp`[%send /b [(met 3 req) req]])]
 :: multiplex reads until both closed
 ~&  ">> multiplexing reads..."
 ;<  st=mux-state  bind:m  (mux-loop *mux-state)

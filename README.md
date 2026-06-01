@@ -12,7 +12,7 @@ Gives Urbit agents outbound TCP connections with TLS support. The `%tcp` agent e
 
 ```hoon
 :tcp &tcp-task [%connect /wire [secure=? =fief]]
-:tcp &tcp-task [%send /wire data=@]
+:tcp &tcp-task [%send /wire data=octs]
 :tcp &tcp-task [%close /wire]
 ```
 
@@ -20,7 +20,7 @@ Gives Urbit agents outbound TCP connections with TLS support. The `%tcp` agent e
 
 ```hoon
 [%connected =wire]
-[%receive =wire data=@]
+[%receive =wire data=octs]
 [%closed =wire]
 [%error =wire msg=@t]
 ```
@@ -105,7 +105,7 @@ With the sidecar running:
 [%pass /my-conn %agent [our.bowl %tcp] %poke %tcp-task !>([%connect /my-conn [%.y %turf ~[['com' 'example' ~]] 443]])]
 
 :: Send data
-[%pass /my-conn %agent [our.bowl %tcp] %poke %tcp-task !>([%send /my-conn 'hello'])]
+[%pass /my-conn %agent [our.bowl %tcp] %poke %tcp-task !>([%send /my-conn 5 'hello'])]
 
 :: Handle events in on-agent
 ++  on-agent

@@ -21,8 +21,8 @@
   ?+    -.gif
     (strand-fail:strandio %unexpected-gift ~[leaf+"got {<-.gif>}"])
       %receive
-    ~&  ">> chunk {<+(n)>}: {<(met 3 data.gif)>} bytes"
-    (tcp-collect wir (cat 3 body (,@t data.gif)) +(n))
+    ~&  ">> chunk {<+(n)>}: {<p.data.gif>} bytes"
+    (tcp-collect wir (cat 3 body (,@t q.data.gif)) +(n))
   ::
       %closed
     ~&  ">> connection closed after {<n>} chunks"
@@ -50,7 +50,7 @@
 ~&  ">> sending HTTP GET ({<(met 3 req)>} bytes)"
 ;<  ~  bind:m
   %-  poke-our:strandio
-  [%tcp %tcp-task !>(`task:tcp`[%send /get req])]
+  [%tcp %tcp-task !>(`task:tcp`[%send /get [(met 3 req) req]])]
 ~&  ">> reading response..."
 ;<  body=@t  bind:m  (tcp-collect /get '' 0)
 =/  len  (met 3 body)

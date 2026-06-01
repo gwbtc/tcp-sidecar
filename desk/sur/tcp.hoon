@@ -13,14 +13,14 @@
 ::
 +$  task
   $%  [%connect =wire =target]
-      [%send =wire data=@]
+      [%send =wire data=octs]
       [%close =wire]
   ==
 ::  gifts: sidecar/runtime -> agent/vane
 ::
 +$  gift
   $%  [%connected =wire]
-      [%receive =wire data=@]
+      [%receive =wire data=octs]
       [%closed =wire]
       [%error =wire msg=@t]
   ==

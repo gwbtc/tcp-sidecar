@@ -19,7 +19,7 @@
   ^-  form:m
   ;<  gif=gift:tcp  bind:m  (tcp-fact wir)
   ?:  ?=(%receive -.gif)
-    ~&  ">> [{<wir>}] received {<(met 3 data.gif)>} bytes"
+    ~&  ">> [{<wir>}] received {<p.data.gif>} bytes"
     (tcp-read-all wir &)
   ?.  ?=(%closed -.gif)
     (strand-fail:strandio %unexpected-gift ~[leaf+"got {<-.gif>}"])
@@ -47,7 +47,7 @@
 ~&  ">> [/a] sending HTTP GET"
 ;<  ~  bind:m
   %-  poke-our:strandio
-  [%tcp %tcp-task !>(`task:tcp`[%send /a req])]
+  [%tcp %tcp-task !>(`task:tcp`[%send /a [(met 3 req) req]])]
 ;<  got-a=?  bind:m  (tcp-read-all /a |)
 ?>  got-a
 ~&  ">> [/a] done"
@@ -63,7 +63,7 @@
 ~&  ">> [/b] sending HTTP GET"
 ;<  ~  bind:m
   %-  poke-our:strandio
-  [%tcp %tcp-task !>(`task:tcp`[%send /b req])]
+  [%tcp %tcp-task !>(`task:tcp`[%send /b [(met 3 req) req]])]
 ;<  got-b=?  bind:m  (tcp-read-all /b |)
 ?>  got-b
 ~&  ">> [/b] done"

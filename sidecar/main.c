@@ -225,8 +225,10 @@ static void
 send_receive(ur_root_t *r, int lick_fd, const char *wire,
              const uint8_t *data, size_t len)
 {
+  ur_nref n_len  = ur_coin64(r, (uint64_t)len);
   ur_nref n_data = make_bytes(r, data, len);
-  send_gift(r, lick_fd, "receive", wire, n_data);
+  ur_nref n_octs = ur_cons(r, n_len, n_data);
+  send_gift(r, lick_fd, "receive", wire, n_octs);
 }
 
 static void
@@ -478,13 +480,28 @@ handle_connect(ur_root_t *r, int lick_fd, ur_nref wire_ref, ur_nref target_ref)
 }
 
 static void
-handle_send(ur_root_t *r, int lick_fd, ur_nref wire_ref, ur_nref data_ref)
+handle_send(ur_root_t *r, int lick_fd, ur_nref wire_ref, ur_nref octs_ref)
 {
   char *wire = read_wire(r, wire_ref);
 
-  size_t len;
-  uint8_t *data = read_bytes(r, data_ref, &len);
-  printf("[%s] task %%send %zu bytes\n", wire, len);
+  // octs: [p=@ud q=@]
+  ur_nref len_ref, data_ref;
+  if ( read_cell(r, octs_ref, &len_ref, &data_ref) < 0 ) {
+    send_error(r, lick_fd, wire, "bad octs");
+    free(wire);
+    return;
+  }
+
+  uint64_t len = read_atom(len_ref);
+  size_t raw_len;
+  uint8_t *data = read_bytes(r, data_ref, &raw_len);
+
+  // Use the octs length (preserves trailing nulls)
+  if ( raw_len < len ) {
+    data = realloc(data, len);
+    memset(data + raw_len, 0, len - raw_len);
+  }
+  printf("[%s] task %%send %llu bytes\n", wire, (unsigned long long)len);
 
   conn_t *c = find_conn(wire);
   if ( !c ) {
@@ -498,14 +515,14 @@ handle_send(ur_root_t *r, int lick_fd, ur_nref wire_ref, ur_nref data_ref)
   if ( c->ssl ) {
     sent = SSL_write(c->ssl, data, (int)len);
   } else {
-    sent = write(c->sock, data, len);
+    sent = write(c->sock, data, (size_t)len);
   }
 
   if ( sent <= 0 ) {
     send_error(r, lick_fd, wire, "send failed");
     close_conn(c);
   } else {
-    printf("[%s] sent %zd/%zu bytes\n", wire, sent, len);
+    printf("[%s] sent %zd/%llu bytes\n", wire, sent, (unsigned long long)len);
   }
 
   free(data);
