@@ -4,6 +4,8 @@
 /=  t-  /ted/test-tcp-get
 /=  t-  /ted/test-tcp-multi
 /=  t-  /ted/test-tcp-mux
+/=  t-  /ted/test-tcp-get-v6
+/=  t-  /ted/test-tcp-connect-v6
 |%
 +$  card  card:agent:gall
 +$  state-0

@@ -400,6 +400,30 @@ handle_connect(ur_root_t *r, int lick_fd, ur_nref wire_ref, ur_nref target_ref)
     snprintf(host, sizeof(host), "%llu.%llu.%llu.%llu",
       (ip >> 24) & 0xff, (ip >> 16) & 0xff, (ip >> 8) & 0xff, ip & 0xff);
   }
+  else if ( strcmp(tag, "is") == 0 ) {
+    // [%is p=@is q=@ud]
+    ur_nref ip_ref, port_ref;
+    if ( read_cell(r, rest, &ip_ref, &port_ref) < 0 ) {
+      send_error(r, lick_fd, wire, "bad is fief");
+      free(tag); free(wire);
+      return;
+    }
+    port = read_atom(port_ref);
+    size_t raw_len;
+    uint8_t *raw = read_bytes(r, ip_ref, &raw_len);
+    uint8_t ip6[16] = {0};
+    if ( raw ) {
+      memcpy(ip6, raw, raw_len < 16 ? raw_len : 16);
+      free(raw);
+    }
+    snprintf(host, sizeof(host),
+      "%02x%02x:%02x%02x:%02x%02x:%02x%02x:"
+      "%02x%02x:%02x%02x:%02x%02x:%02x%02x",
+      ip6[15], ip6[14], ip6[13], ip6[12],
+      ip6[11], ip6[10], ip6[9],  ip6[8],
+      ip6[7],  ip6[6],  ip6[5],  ip6[4],
+      ip6[3],  ip6[2],  ip6[1],  ip6[0]);
+  }
   else {
     send_error(r, lick_fd, wire, "unsupported fief type");
     free(tag); free(wire);
