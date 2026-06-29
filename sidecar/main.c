@@ -639,8 +639,10 @@ main(int argc, char **argv)
 
     int ready = poll(pfds, nfds, 100);
     if ( ready < 0 ) {
-      if ( errno == EINTR ) continue;
+      if ( errno == EINTR ) goto next;
       perror("poll");
+      free(pfds);
+      free(conn_pfd_map);
       break;
     }
 
@@ -690,6 +692,8 @@ main(int argc, char **argv)
       uint8_t hdr[5];
       if ( read_exact(lick_fd, hdr, 5) < 0 ) {
         printf("lick: connection closed\n");
+        free(pfds);
+        free(conn_pfd_map);
         break;
       }
 
@@ -703,6 +707,8 @@ main(int argc, char **argv)
       if ( read_exact(lick_fd, jam_byt, jam_len) < 0 ) {
         printf("lick: read failed\n");
         free(jam_byt);
+        free(pfds);
+        free(conn_pfd_map);
         break;
       }
 
@@ -710,25 +716,25 @@ main(int argc, char **argv)
       if ( ur_cue(r, jam_len, jam_byt, &noun) != ur_cue_good ) {
         printf("cue failed\n");
         free(jam_byt);
-        continue;
+        goto next;
       }
       free(jam_byt);
 
       // Expect [%tcp-task payload]
       ur_nref mark_ref, payload;
-      if ( read_cell(r, noun, &mark_ref, &payload) < 0 ) continue;
+      if ( read_cell(r, noun, &mark_ref, &payload) < 0 ) goto next;
 
       char *mark = read_cord(r, mark_ref);
       if ( strcmp(mark, "tcp-task") != 0 ) {
         printf("lick: ignoring mark %s\n", mark);
         free(mark);
-        continue;
+        goto next;
       }
       free(mark);
 
       // payload is [%cmd wire ...]
       ur_nref cmd_ref, cmd_rest;
-      if ( read_cell(r, payload, &cmd_ref, &cmd_rest) < 0 ) continue;
+      if ( read_cell(r, payload, &cmd_ref, &cmd_rest) < 0 ) goto next;
 
       char *cmd = read_cord(r, cmd_ref);
 
@@ -758,6 +764,7 @@ main(int argc, char **argv)
       r = ur_root_init();
     }
 
+  next:
     free(pfds);
     free(conn_pfd_map);
   }
