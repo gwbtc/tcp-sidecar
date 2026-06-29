@@ -9,10 +9,21 @@
 #include <errno.h>
 #include <poll.h>
 #include <fcntl.h>
+#include <execinfo.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 
 #include "ur/ur.h"
+
+static void
+crash_handler(int sig)
+{
+  void *frames[64];
+  int n = backtrace(frames, 64);
+  fprintf(stderr, "\n--- CRASH: signal %d ---\n", sig);
+  backtrace_symbols_fd(frames, n, STDERR_FILENO);
+  _exit(1);
+}
 
 // --- Noun helpers ---
 
@@ -579,6 +590,10 @@ main(int argc, char **argv)
     return 1;
   }
 
+  setbuf(stdout, NULL);
+  signal(SIGSEGV, crash_handler);
+  signal(SIGBUS, crash_handler);
+  signal(SIGABRT, crash_handler);
   signal(SIGPIPE, SIG_IGN);
 
   // Init OpenSSL
