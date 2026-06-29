@@ -12,6 +12,12 @@ $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 clean:
-	rm -f $(OBJS) $(TARGET)
+	rm -f $(OBJS) $(TARGET) stress-test stress-test.o
 
-.PHONY: clean
+asan: clean
+	$(MAKE) CFLAGS="-Wall -Wextra -O0 -g -fsanitize=address -I. $(shell pkg-config --cflags openssl 2>/dev/null)" LDFLAGS="-fsanitize=address $(shell pkg-config --libs openssl 2>/dev/null || echo '-lssl -lcrypto')"
+
+stress-test: stress-test.o ur/hashcons.o ur/bitstream.o ur/serial.o ur/murmur3.o
+	$(CC) $(CFLAGS) -o $@ $^
+
+.PHONY: clean asan
