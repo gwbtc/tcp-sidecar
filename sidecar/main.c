@@ -21,7 +21,9 @@ crash_handler(int sig)
 {
   void *frames[64];
   int n = backtrace(frames, 64);
-  fprintf(stderr, "\n--- CRASH: signal %d ---\n", sig);
+  char buf[64];
+  int len = snprintf(buf, sizeof(buf), "\n--- CRASH: signal %d ---\n", sig);
+  write(STDERR_FILENO, buf, len);
   backtrace_symbols_fd(frames, n, STDERR_FILENO);
   _exit(1);
 }
