@@ -31,7 +31,7 @@
   ;<  ~  bind:m  (watch-our:strandio wir %tcp wir)
   ;<  ~  bind:m
     %-  poke-our:strandio
-    [%tcp %tcp-task !>(`task:tcp`[%connect wir [%.y %turf ~[['com' 'example' ~]] 443]])]
+    [%tcp %tcp-task !>(`task:tcp`[%connect wir [%.y %turf ~[['com' 'example' ~]] 443] ~])]
   ;<  gif=gift:tcp  bind:m  (tcp-fact wir)
   ?.  ?=(%connected -.gif)
     ~&  ">> [{<n>}] unexpected: {<-.gif>}"

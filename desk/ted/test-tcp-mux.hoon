@@ -62,10 +62,10 @@
 ~&  ">> connecting /a and /b to example.com:443"
 ;<  ~  bind:m
   %-  poke-our:strandio
-  [%tcp %tcp-task !>(`task:tcp`[%connect /a [%.y %turf ~[['com' 'example' ~]] 443]])]
+  [%tcp %tcp-task !>(`task:tcp`[%connect /a [%.y %turf ~[['com' 'example' ~]] 443] ~])]
 ;<  ~  bind:m
   %-  poke-our:strandio
-  [%tcp %tcp-task !>(`task:tcp`[%connect /b [%.y %turf ~[['com' 'example' ~]] 443]])]
+  [%tcp %tcp-task !>(`task:tcp`[%connect /b [%.y %turf ~[['com' 'example' ~]] 443] ~])]
 :: wait for both connected (order doesn't matter)
 ~&  ">> waiting for both connected..."
 ;<  [pax=path gif=gift:tcp]  bind:m  (tcp-fact-prefix /conn)

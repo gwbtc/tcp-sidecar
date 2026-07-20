@@ -39,7 +39,7 @@
 ~&  ">> connecting to example.com:443 (tls)"
 ;<  ~  bind:m
   %-  poke-our:strandio
-  [%tcp %tcp-task !>(`task:tcp`[%connect /get [%.y %turf ~[['com' 'example' ~]] 443]])]
+  [%tcp %tcp-task !>(`task:tcp`[%connect /get [%.y %turf ~[['com' 'example' ~]] 443] ~])]
 ;<  gif=gift:tcp  bind:m  (tcp-fact /get)
 ~&  ">> got {<-.gif>}"
 ?>  =(-.gif %connected)

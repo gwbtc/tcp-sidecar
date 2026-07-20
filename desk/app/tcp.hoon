@@ -45,9 +45,19 @@
   |=  [=wire sign=sign-arvo]
   ^-  (quip card _this)
   ?.  ?=([%lick %soak *] sign)  (on-arvo:def +<)
+  ?:  ?=([%disconnect ~] [mark noun]:sign)
+    ~&  'tcp: sidecar disconnected'
+    =/  wires=(list ^wire)  ~(tap in open)
+    =.  open  ~
+    :-  %-  zing
+        %+  turn  wires
+        |=  wir=^wire
+        :~  [%give %fact ~[wir] %tcp-gift !>(`gift:tcp`[%error wir 'sidecar disconnected'])]
+            [%give %kick ~[wir] ~]
+        ==
+    this
   ?+    [mark noun]:sign  (on-arvo:def +<)
     [%connect ~]     ~&('tcp: sidecar connected' `this)
-    [%disconnect ~]  ~&('tcp: sidecar disconnected' `this)
     [%error *]       ~&("tcp: error {(trip ;;(@t noun.sign))}" `this)
   ::
       [%tcp-gift *]

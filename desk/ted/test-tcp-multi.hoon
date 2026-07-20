@@ -40,7 +40,7 @@
 ;<  ~  bind:m  (watch-our:strandio /a %tcp /a)
 ;<  ~  bind:m
   %-  poke-our:strandio
-  [%tcp %tcp-task !>(`task:tcp`[%connect /a [%.y %turf ~[['com' 'example' ~]] 443]])]
+  [%tcp %tcp-task !>(`task:tcp`[%connect /a [%.y %turf ~[['com' 'example' ~]] 443] ~])]
 ;<  gif-a=gift:tcp  bind:m  (tcp-fact /a)
 ~&  ">> [/a] got {<-.gif-a>}"
 ?>  =(-.gif-a %connected)
@@ -56,7 +56,7 @@
 ;<  ~  bind:m  (watch-our:strandio /b %tcp /b)
 ;<  ~  bind:m
   %-  poke-our:strandio
-  [%tcp %tcp-task !>(`task:tcp`[%connect /b [%.y %turf ~[['com' 'example' ~]] 443]])]
+  [%tcp %tcp-task !>(`task:tcp`[%connect /b [%.y %turf ~[['com' 'example' ~]] 443] ~])]
 ;<  gif-b=gift:tcp  bind:m  (tcp-fact /b)
 ~&  ">> [/b] got {<-.gif-b>}"
 ?>  =(-.gif-b %connected)

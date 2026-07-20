@@ -10,6 +10,7 @@
 #include <poll.h>
 #include <fcntl.h>
 #include <execinfo.h>
+#include <time.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 
@@ -258,11 +259,29 @@ send_error(ur_root_t *r, int lick_fd, const char *wire, const char *msg)
 
 // --- Connection state ---
 
+static uint64_t
+now_ms(void)
+{
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+typedef enum {
+  CONN_CONNECTING,
+  CONN_HANDSHAKING,
+  CONN_ACTIVE
+} conn_state_t;
+
 typedef struct {
-  int       active;
-  int       sock;
-  SSL      *ssl;
-  char      wire[256];
+  int          active;
+  conn_state_t state;
+  int          sock;
+  SSL         *ssl;
+  char         wire[256];
+  int          secure;
+  char         host[256];
+  uint64_t     deadline_ms;
 } conn_t;
 
 static conn_t   *conns;
@@ -317,7 +336,8 @@ set_nonblock(int fd)
 // --- Handle commands from the agent ---
 
 static void
-handle_connect(ur_root_t *r, int lick_fd, ur_nref wire_ref, ur_nref target_ref)
+handle_connect(ur_root_t *r, int lick_fd, ur_nref wire_ref, ur_nref target_ref,
+               uint64_t timeout_ms)
 {
   char *wire = read_wire(r, wire_ref);
   printf("[%s] task %%connect\n", wire);
@@ -353,8 +373,6 @@ handle_connect(ur_root_t *r, int lick_fd, ur_nref wire_ref, ur_nref target_ref)
   uint64_t port = 0;
 
   if ( strcmp(tag, "turf") == 0 ) {
-    // [%turf p=(list turf) q=@ud]
-    // turf is (list @t) tld-first, we need to reverse and join with dots
     ur_nref turfs_ref, port_ref;
     if ( read_cell(r, rest, &turfs_ref, &port_ref) < 0 ) {
       send_error(r, lick_fd, wire, "bad turf fief");
@@ -363,8 +381,6 @@ handle_connect(ur_root_t *r, int lick_fd, ur_nref wire_ref, ur_nref target_ref)
     }
     port = read_atom(port_ref);
 
-    // turfs_ref is (list turf) — for now just handle the first turf
-    // each turf is (list @t) tld-first
     ur_nref turf_ref;
     if ( ur_nref_tag(turfs_ref) == ur_icell ) {
       ur_nref h, t;
@@ -376,7 +392,6 @@ handle_connect(ur_root_t *r, int lick_fd, ur_nref wire_ref, ur_nref target_ref)
       return;
     }
 
-    // Collect turf segments (tld-first), reverse for hostname
     char *segs[32];
     int nseg = 0;
     ur_nref cur = turf_ref;
@@ -387,7 +402,6 @@ handle_connect(ur_root_t *r, int lick_fd, ur_nref wire_ref, ur_nref target_ref)
       cur = t;
     }
 
-    // Build hostname: reverse tld-first to normal order
     size_t pos = 0;
     for ( int i = nseg - 1; i >= 0; i-- ) {
       if ( pos > 0 ) host[pos++] = '.';
@@ -399,7 +413,6 @@ handle_connect(ur_root_t *r, int lick_fd, ur_nref wire_ref, ur_nref target_ref)
     host[pos] = '\0';
   }
   else if ( strcmp(tag, "if") == 0 ) {
-    // [%if p=@if q=@ud]
     ur_nref ip_ref, port_ref;
     if ( read_cell(r, rest, &ip_ref, &port_ref) < 0 ) {
       send_error(r, lick_fd, wire, "bad if fief");
@@ -412,7 +425,6 @@ handle_connect(ur_root_t *r, int lick_fd, ur_nref wire_ref, ur_nref target_ref)
       (ip >> 24) & 0xff, (ip >> 16) & 0xff, (ip >> 8) & 0xff, ip & 0xff);
   }
   else if ( strcmp(tag, "is") == 0 ) {
-    // [%is p=@is q=@ud]
     ur_nref ip_ref, port_ref;
     if ( read_cell(r, rest, &ip_ref, &port_ref) < 0 ) {
       send_error(r, lick_fd, wire, "bad is fief");
@@ -442,10 +454,11 @@ handle_connect(ur_root_t *r, int lick_fd, ur_nref wire_ref, ur_nref target_ref)
   }
   free(tag);
 
-  printf("[%s] resolving %s:%llu %s\n", wire, host, (unsigned long long)port,
-    secure ? "(tls)" : "(plain)");
+  printf("[%s] resolving %s:%llu %s (timeout %llums)\n", wire, host,
+    (unsigned long long)port, secure ? "(tls)" : "(plain)",
+    (unsigned long long)timeout_ms);
 
-  // DNS resolve
+  // DNS resolve (blocking — async DNS is platform-specific)
   char port_str[8];
   snprintf(port_str, sizeof(port_str), "%llu", (unsigned long long)port);
 
@@ -462,7 +475,7 @@ handle_connect(ur_root_t *r, int lick_fd, ur_nref wire_ref, ur_nref target_ref)
     return;
   }
 
-  // TCP connect
+  // Non-blocking connect
   int sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
   if ( sock < 0 ) {
     send_error(r, lick_fd, wire, strerror(errno));
@@ -470,47 +483,45 @@ handle_connect(ur_root_t *r, int lick_fd, ur_nref wire_ref, ur_nref target_ref)
     free(wire);
     return;
   }
+  set_nonblock(sock);
 
-  if ( connect(sock, res->ai_addr, res->ai_addrlen) < 0 ) {
+  int ret = connect(sock, res->ai_addr, res->ai_addrlen);
+  freeaddrinfo(res);
+
+  memset(c, 0, sizeof(*c));
+  c->active = 1;
+  c->sock = sock;
+  c->secure = secure;
+  strncpy(c->wire, wire, sizeof(c->wire) - 1);
+  strncpy(c->host, host, sizeof(c->host) - 1);
+  c->deadline_ms = now_ms() + timeout_ms;
+
+  if ( ret == 0 ) {
+    // Instant connect (localhost etc)
+    if ( secure ) {
+      c->ssl = SSL_new(ssl_ctx);
+      SSL_set_fd(c->ssl, c->sock);
+      SSL_set_tlsext_host_name(c->ssl, c->host);
+      SSL_set_connect_state(c->ssl);
+      c->state = CONN_HANDSHAKING;
+    } else {
+      c->state = CONN_ACTIVE;
+      send_connected(r, lick_fd, wire);
+      printf("[%s] gift %%connected -> %s:%llu\n", wire, host, (unsigned long long)port);
+    }
+  }
+  else if ( errno == EINPROGRESS ) {
+    c->state = CONN_CONNECTING;
+    printf("[%s] connecting async...\n", wire);
+  }
+  else {
     char err[256];
     snprintf(err, sizeof(err), "connect: %s", strerror(errno));
     send_error(r, lick_fd, wire, err);
     close(sock);
-    freeaddrinfo(res);
-    free(wire);
-    return;
-  }
-  freeaddrinfo(res);
-
-  // TLS handshake if secure
-  SSL *ssl = NULL;
-  if ( secure ) {
-    ssl = SSL_new(ssl_ctx);
-    SSL_set_fd(ssl, sock);
-    SSL_set_tlsext_host_name(ssl, host);
-
-    if ( SSL_connect(ssl) != 1 ) {
-      send_error(r, lick_fd, wire, "tls handshake failed");
-      SSL_free(ssl);
-      close(sock);
-      free(wire);
-      return;
-    }
-    printf("[%s] tls handshake ok\n", wire);
+    c->active = 0;
   }
 
-  // Set non-blocking after connect/handshake
-  set_nonblock(sock);
-
-  // Store connection
-  memset(c, 0, sizeof(*c));
-  c->active = 1;
-  c->sock = sock;
-  c->ssl = ssl;
-  strncpy(c->wire, wire, sizeof(c->wire) - 1);
-
-  send_connected(r, lick_fd, wire);
-  printf("[%s] gift %%connected -> %s:%llu\n", wire, host, (unsigned long long)port);
   free(wire);
 }
 
@@ -633,6 +644,23 @@ main(int argc, char **argv)
   // lick_fd stays blocking: poll() guards reads, writes must complete fully
 
   while ( 1 ) {
+    // Check timeouts on pending connections
+    uint64_t ts = now_ms();
+    for ( size_t i = 0; i < conns_len; i++ ) {
+      conn_t *c = &conns[i];
+      if ( !c->active || c->state == CONN_ACTIVE ) continue;
+      if ( ts >= c->deadline_ms ) {
+        printf("[%s] timeout (%s)\n", c->wire,
+          c->state == CONN_CONNECTING ? "connect" : "tls");
+        char wire_copy[256];
+        strncpy(wire_copy, c->wire, sizeof(wire_copy));
+        close_conn(c);
+        send_error(r, lick_fd, wire_copy, "connect timeout");
+        ur_root_free(r);
+        r = ur_root_init();
+      }
+    }
+
     // Build poll set: lick_fd + all active connection sockets
     size_t pfd_cap = 1 + conns_len;
     struct pollfd *pfds = malloc(pfd_cap * sizeof(struct pollfd));
@@ -644,12 +672,15 @@ main(int argc, char **argv)
     nfds++;
 
     for ( size_t i = 0; i < conns_len; i++ ) {
-      if ( conns[i].active ) {
-        conn_pfd_map[nfds - 1] = i;
-        pfds[nfds].fd = conns[i].sock;
-        pfds[nfds].events = POLLIN;
-        nfds++;
+      if ( !conns[i].active ) continue;
+      conn_pfd_map[nfds - 1] = i;
+      pfds[nfds].fd = conns[i].sock;
+      switch ( conns[i].state ) {
+        case CONN_CONNECTING:  pfds[nfds].events = POLLOUT; break;
+        case CONN_HANDSHAKING: pfds[nfds].events = POLLIN | POLLOUT; break;
+        case CONN_ACTIVE:      pfds[nfds].events = POLLIN; break;
       }
+      nfds++;
     }
 
     int ready = poll(pfds, nfds, 100);
@@ -661,12 +692,74 @@ main(int argc, char **argv)
       break;
     }
 
-    // Check for data on TCP connections
+    // Handle connection events
     for ( int p = 1; p < nfds; p++ ) {
-      if ( !(pfds[p].revents & (POLLIN | POLLHUP | POLLERR)) ) continue;
+      if ( !pfds[p].revents ) continue;
 
       size_t ci = conn_pfd_map[p - 1];
       conn_t *c = &conns[ci];
+
+      // TCP connect completing
+      if ( c->state == CONN_CONNECTING ) {
+        if ( pfds[p].revents & (POLLOUT | POLLERR | POLLHUP) ) {
+          int err;
+          socklen_t elen = sizeof(err);
+          getsockopt(c->sock, SOL_SOCKET, SO_ERROR, &err, &elen);
+          if ( err != 0 ) {
+            char msg[256];
+            snprintf(msg, sizeof(msg), "connect: %s", strerror(err));
+            char wire_copy[256];
+            strncpy(wire_copy, c->wire, sizeof(wire_copy));
+            close_conn(c);
+            send_error(r, lick_fd, wire_copy, msg);
+            ur_root_free(r);
+            r = ur_root_init();
+          }
+          else if ( c->secure ) {
+            c->ssl = SSL_new(ssl_ctx);
+            SSL_set_fd(c->ssl, c->sock);
+            SSL_set_tlsext_host_name(c->ssl, c->host);
+            SSL_set_connect_state(c->ssl);
+            c->state = CONN_HANDSHAKING;
+            printf("[%s] tcp connected, starting tls\n", c->wire);
+          }
+          else {
+            c->state = CONN_ACTIVE;
+            send_connected(r, lick_fd, c->wire);
+            printf("[%s] gift %%connected\n", c->wire);
+            ur_root_free(r);
+            r = ur_root_init();
+          }
+        }
+        continue;
+      }
+
+      // TLS handshake in progress
+      if ( c->state == CONN_HANDSHAKING ) {
+        int ret = SSL_connect(c->ssl);
+        if ( ret == 1 ) {
+          c->state = CONN_ACTIVE;
+          send_connected(r, lick_fd, c->wire);
+          printf("[%s] tls handshake ok, gift %%connected\n", c->wire);
+          ur_root_free(r);
+          r = ur_root_init();
+        } else {
+          int err = SSL_get_error(c->ssl, ret);
+          if ( err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE ) {
+            char wire_copy[256];
+            strncpy(wire_copy, c->wire, sizeof(wire_copy));
+            close_conn(c);
+            send_error(r, lick_fd, wire_copy, "tls handshake failed");
+            ur_root_free(r);
+            r = ur_root_init();
+          }
+        }
+        continue;
+      }
+
+      // Active connection — handle incoming data
+      if ( !(pfds[p].revents & (POLLIN | POLLHUP | POLLERR)) ) continue;
+
       uint8_t buf[8192];
       ssize_t n;
 
@@ -675,13 +768,13 @@ main(int argc, char **argv)
         if ( n <= 0 ) {
           int err = SSL_get_error(c->ssl, n);
           if ( err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE ) {
-            continue;  // not ready yet, try again later
+            continue;
           }
         }
       } else {
         n = read(c->sock, buf, sizeof(buf));
         if ( n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) ) {
-          continue;  // non-blocking, no data yet
+          continue;
         }
       }
 
@@ -697,7 +790,6 @@ main(int argc, char **argv)
         send_closed(r, lick_fd, wire_copy);
       }
 
-      // Reset noun allocator after each gift
       ur_root_free(r);
       r = ur_root_init();
     }
@@ -754,9 +846,32 @@ main(int argc, char **argv)
       char *cmd = read_cord(r, cmd_ref);
 
       if ( strcmp(cmd, "connect") == 0 ) {
-        ur_nref wire_ref, target_ref;
-        if ( read_cell(r, cmd_rest, &wire_ref, &target_ref) == 0 ) {
-          handle_connect(r, lick_fd, wire_ref, target_ref);
+        ur_nref wire_ref, rest;
+        if ( read_cell(r, cmd_rest, &wire_ref, &rest) == 0 ) {
+          // Detect new format [wire [target timeout]] vs old [wire target]
+          // Old: rest = [secure fief] — head is atom (loobean)
+          // New: rest = [[secure fief] timeout] — head is cell
+          ur_nref head, tail;
+          uint64_t timeout_ms = 30000;
+          ur_nref target_ref;
+
+          if ( read_cell(r, rest, &head, &tail) == 0
+               && ur_nref_tag(head) == ur_icell ) {
+            // New format
+            target_ref = head;
+            if ( ur_nref_tag(tail) == ur_icell ) {
+              ur_nref u_tag, u_val;
+              if ( read_cell(r, tail, &u_tag, &u_val) == 0 ) {
+                uint64_t v = read_atom(u_val);
+                if ( v > 0 ) timeout_ms = v;
+              }
+            }
+          } else {
+            // Old format — rest is the target directly
+            target_ref = rest;
+          }
+
+          handle_connect(r, lick_fd, wire_ref, target_ref, timeout_ms);
         }
       }
       else if ( strcmp(cmd, "send") == 0 ) {
@@ -774,7 +889,6 @@ main(int argc, char **argv)
 
       free(cmd);
 
-      // Reset noun allocator to prevent unbounded growth
       ur_root_free(r);
       r = ur_root_init();
     }

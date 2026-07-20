@@ -26,7 +26,7 @@
   %-  poke-our:strandio
   :*  %tcp  %tcp-task
     !>  ^-  task:tcp
-    [%connect /test-v6 [%.n %is .0.0.0.0.0.0.0.1 12.345]]
+    [%connect /test-v6 [%.n %is .0.0.0.0.0.0.0.1 12.345] ~]
   ==
 ;<  gif=gift:tcp  bind:m  (tcp-fact /test-v6)
 ~&  ">> got {<-.gif>}"

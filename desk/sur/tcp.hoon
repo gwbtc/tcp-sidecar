@@ -12,7 +12,7 @@
 ::  tasks: agent/vane -> sidecar/runtime
 ::
 +$  task
-  $%  [%connect =wire =target]
+  $%  [%connect =wire =target timeout=(unit @ud)]
       [%send =wire data=octs]
       [%close =wire]
   ==
