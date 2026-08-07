@@ -47,12 +47,16 @@
   ?.  ?=([%lick %soak *] sign)  (on-arvo:def +<)
   ?:  ?=([%disconnect ~] [mark noun]:sign)
     ~&  'tcp: sidecar disconnected'
+    ::  flush every open wire as %closed, not %error: a dead sidecar says
+    ::  nothing about the remote peer's health, so consumers must not
+    ::  attribute the fault to the peer (e.g. blacklisting it). %error is
+    ::  reserved for a genuine per-connection failure from a live sidecar.
     =/  wires=(list ^wire)  ~(tap in open)
     =.  open  ~
     :-  %-  zing
         %+  turn  wires
         |=  wir=^wire
-        :~  [%give %fact ~[wir] %tcp-gift !>(`gift:tcp`[%error wir 'sidecar disconnected'])]
+        :~  [%give %fact ~[wir] %tcp-gift !>(`gift:tcp`[%closed wir])]
             [%give %kick ~[wir] ~]
         ==
     this
