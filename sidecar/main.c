@@ -762,7 +762,11 @@ main(int argc, char **argv)
       // Active connection — handle incoming data
       if ( !(pfds[p].revents & (POLLIN | POLLHUP | POLLERR)) ) continue;
 
-      uint8_t buf[8192];
+      // One %receive gift -- one Urbit event -- per read().  At 8 KB a
+      // 2 MB Bitcoin block was ~250 events, each re-concatenating the
+      // growing buffer on the ship side; 256 KB makes it ~8.  Static:
+      // this loop is single-threaded.
+      static uint8_t buf[262144];
       ssize_t n;
 
       if ( c->ssl ) {
