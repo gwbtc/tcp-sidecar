@@ -8,6 +8,8 @@
 /=  t-  /ted/test-tcp-connect-v6
 |%
 +$  card  card:agent:gall
+::  debug traces; flip to & to diagnose
+++  dbg  ^-(? |)
 +$  state-0
   $:  %0
       open=(set wire)
@@ -46,7 +48,7 @@
   ^-  (quip card _this)
   ?.  ?=([%lick %soak *] sign)  (on-arvo:def +<)
   ?:  ?=([%disconnect ~] [mark noun]:sign)
-    ~&  'tcp: sidecar disconnected'
+    ~>  %slog.[2 leaf+"%tcp: sidecar disconnected, open connections closed; restart the tcp-sidecar process if it does not reconnect"]
     ::  flush every open wire as %closed, not %error: a dead sidecar says
     ::  nothing about the remote peer's health, so consumers must not
     ::  attribute the fault to the peer (e.g. blacklisting it). %error is
@@ -61,8 +63,8 @@
         ==
     this
   ?+    [mark noun]:sign  (on-arvo:def +<)
-    [%connect ~]     ~&('tcp: sidecar connected' `this)
-    [%error *]       ~&("tcp: error {(trip ;;(@t noun.sign))}" `this)
+    [%connect ~]     ~?(dbg 'tcp: sidecar connected' `this)
+    [%error *]       ~>(%slog.[2 leaf+"%tcp: sidecar request failed; check the tcp-sidecar process is running: {(trip ;;(@t noun.sign))}"] `this)
   ::
       [%tcp-gift *]
     =/  gif  (gift:tcp noun.sign)
