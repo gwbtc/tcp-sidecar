@@ -801,6 +801,72 @@ test_big_read(int secure)
   close(srv);
 }
 
+// A wire of n segments, each the cord seg
+static ur_nref
+long_wire(const char *seg, int n)
+{
+  ur_nref w = 0;
+  for ( int i = 0; i < n; i++ ) w = ur_cons(r, cord(seg), w);
+  return w;
+}
+
+// Check that the next gift is %error 'wire too long'
+static void
+expect_too_long(const char *what)
+{
+  gift_t g;
+  check(get(&g, WAIT_MS) == 0 && strcmp(g.tag, "error") == 0
+        && strcmp(g.msg, "wire too long") == 0, what);
+  free(g.data);
+}
+
+// A wire too long to track gets an %error; it once overran a buffer
+static void
+test_long_wire(void)
+{
+  printf("long wire\n");
+  char seg[2001];
+  memset(seg, 'a', sizeof(seg) - 1);
+  seg[sizeof(seg) - 1] = '\0';
+
+  ur_nref target = ur_cons(r, 1,
+    fief("if", ur_coin64(r, 0x7f000001), ur_coin64(r, 9)));
+  put(ur_cons(r, cord("connect"),
+        ur_cons(r, long_wire(seg, 1), ur_cons(r, target, 0))));
+  expect_too_long("%connect on one 2000-byte segment");
+
+  target = ur_cons(r, 1,
+    fief("if", ur_coin64(r, 0x7f000001), ur_coin64(r, 9)));
+  put(ur_cons(r, cord("connect"),
+        ur_cons(r, long_wire("s", 65), ur_cons(r, target, 0))));
+  expect_too_long("%connect on 65 segments");
+
+  put(ur_cons(r, cord("send"),
+        ur_cons(r, long_wire(seg, 3), ur_cons(r, 1, cord("x")))));
+  expect_too_long("%send on a long wire");
+
+  put(ur_cons(r, cord("close"), long_wire(seg, 3)));
+  expect_too_long("%close on a long wire");
+
+  // A wire just under both limits still works
+  uint16_t port;
+  int srv = tcp_listen(AF_INET, &port);
+  if ( srv < 0 ) die("tcp_listen");
+  target = ur_cons(r, 1,
+    fief("if", ur_coin64(r, 0x7f000001), ur_coin64(r, port)));
+  put(ur_cons(r, cord("connect"),
+        ur_cons(r, long_wire("abc", 63), ur_cons(r, target, 0))));
+  gift_t g;
+  check(get(&g, WAIT_MS) == 0 && strcmp(g.tag, "connected") == 0,
+        "a 63-segment wire connects");
+  free(g.data);
+  put(ur_cons(r, cord("close"), long_wire("abc", 63)));
+  check(get(&g, WAIT_MS) == 0 && strcmp(g.tag, "closed") == 0,
+        "and closes");
+  free(g.data);
+  close(srv);
+}
+
 // Issue 4: the sidecar starts before vere and waits for the socket
 static void
 test_late_vere(void)
@@ -880,6 +946,7 @@ main(void)
   test_basic(0);
   test_basic(1);
   test_wide_atoms();
+  test_long_wire();
   test_short_write(0);
   test_short_write(1);
   test_big_read(0);

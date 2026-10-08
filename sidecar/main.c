@@ -132,21 +132,34 @@ read_cell(ur_root_t *r, ur_nref ref, ur_nref *head, ur_nref *tail)
   return 0;
 }
 
-// Read a wire (path) from a noun — returns malloc'd string like "/foo/bar"
+// Longest wire the sidecar tracks, as a string with its NUL, and the
+// most segments. conn_t.wire and make_wire are sized to these.
+#define WIRE_MAX  256
+#define WIRE_SEGS 64
+
+// Read a wire (path) from a noun — returns malloc'd string like "/foo/bar",
+// or NULL if the wire is over WIRE_MAX or WIRE_SEGS
 static char*
 read_wire(ur_root_t *r, ur_nref ref)
 {
   // A wire is a list of cords: [%foo %bar ~] -> "/foo/bar"
-  char buf[1024] = {0};
+  char buf[WIRE_MAX] = {0};
   size_t pos = 0;
+  int nseg = 0;
   ur_nref cur = ref;
 
   while ( ur_nref_tag(cur) == ur_icell ) {
     ur_nref h, t;
     read_cell(r, cur, &h, &t);
     char *seg = read_cord(r, h);
-    int n = snprintf(buf + pos, sizeof(buf) - pos, "/%s", seg);
-    pos += n;
+    size_t len = strlen(seg);
+    if ( ++nseg > WIRE_SEGS || pos + 1 + len >= sizeof(buf) ) {
+      free(seg);
+      return NULL;
+    }
+    buf[pos++] = '/';
+    memcpy(buf + pos, seg, len);
+    pos += len;
     free(seg);
     cur = t;
   }
@@ -161,7 +174,7 @@ make_wire(ur_root_t *r, const char *path)
 {
   // Parse "/foo/bar" into [%foo %bar ~]
   // We store segments then build the list in reverse
-  const char *segs[64];
+  const char *segs[WIRE_SEGS];
   int nseg = 0;
   const char *p = path;
 
@@ -236,13 +249,13 @@ write_exact(int fd, const uint8_t *buf, size_t n)
 
 // --- Send gift nouns over Lick ---
 
+// Send a gift on a wire given as a noun
 static void
-send_gift(ur_root_t *r, int lick_fd, const char *tag, const char *wire,
-          ur_nref extra)
+send_gift_on(ur_root_t *r, int lick_fd, const char *tag, ur_nref n_wire,
+             ur_nref extra)
 {
   ur_nref n_mark = make_cord(r, "tcp-gift");
   ur_nref n_tag  = make_cord(r, tag);
-  ur_nref n_wire = make_wire(r, wire);
   ur_nref payload;
 
   if ( extra == (ur_nref)-1 ) {
@@ -260,6 +273,13 @@ send_gift(ur_root_t *r, int lick_fd, const char *tag, const char *wire,
   // socket on its next pass and reconnects; this gift has no reader.
   write_exact(lick_fd, msg, msg_len);
   free(msg);
+}
+
+static void
+send_gift(ur_root_t *r, int lick_fd, const char *tag, const char *wire,
+          ur_nref extra)
+{
+  send_gift_on(r, lick_fd, tag, make_wire(r, wire), extra);
 }
 
 static void
@@ -292,6 +312,19 @@ send_error(ur_root_t *r, int lick_fd, const char *wire, const char *msg)
   send_gift(r, lick_fd, "error", wire, n_msg);
 }
 
+// Read a task's wire. A wire too long to track gets %error, sent on the
+// wire as the task gave it, and NULL comes back.
+static char*
+task_wire(ur_root_t *r, int lick_fd, ur_nref wire_ref)
+{
+  char *wire = read_wire(r, wire_ref);
+  if ( !wire ) {
+    printf("task on a wire too long to track -> gift %%error\n");
+    send_gift_on(r, lick_fd, "error", wire_ref, make_cord(r, "wire too long"));
+  }
+  return wire;
+}
+
 // --- Connection state ---
 
 static uint64_t
@@ -313,7 +346,7 @@ typedef struct {
   conn_state_t state;
   int          sock;
   SSL         *ssl;
-  char         wire[256];
+  char         wire[WIRE_MAX];
   int          secure;
   char         host[256];
   uint64_t     deadline_ms;
@@ -626,7 +659,8 @@ read_target(ur_root_t *r, ur_nref target_ref, int *secure,
 static void
 handle_connect(ur_root_t *r, int lick_fd, ur_nref wire_ref, ur_nref rest)
 {
-  char *wire = read_wire(r, wire_ref);
+  char *wire = task_wire(r, lick_fd, wire_ref);
+  if ( !wire ) return;
   printf("[%s] task %%connect\n", wire);
 
   if ( find_conn(wire) ) {
@@ -746,7 +780,8 @@ handle_connect(ur_root_t *r, int lick_fd, ur_nref wire_ref, ur_nref rest)
 static void
 handle_send(ur_root_t *r, int lick_fd, ur_nref wire_ref, ur_nref octs_ref)
 {
-  char *wire = read_wire(r, wire_ref);
+  char *wire = task_wire(r, lick_fd, wire_ref);
+  if ( !wire ) return;
 
   conn_t *c = find_conn(wire);
 
@@ -802,7 +837,8 @@ handle_send(ur_root_t *r, int lick_fd, ur_nref wire_ref, ur_nref octs_ref)
 static void
 handle_close(ur_root_t *r, int lick_fd, ur_nref wire_ref)
 {
-  char *wire = read_wire(r, wire_ref);
+  char *wire = task_wire(r, lick_fd, wire_ref);
+  if ( !wire ) return;
   printf("[%s] task %%close\n", wire);
   conn_t *c = find_conn(wire);
 
@@ -940,7 +976,7 @@ main(int argc, char **argv)
       if ( ts >= c->deadline_ms ) {
         printf("[%s] timeout (%s)\n", c->wire,
           c->state == CONN_CONNECTING ? "connect" : "tls");
-        char wire_copy[256];
+        char wire_copy[WIRE_MAX];
         strncpy(wire_copy, c->wire, sizeof(wire_copy));
         close_conn(c);
         send_error(r, lick_fd, wire_copy, "connect timeout");
@@ -1003,7 +1039,7 @@ main(int argc, char **argv)
           if ( err != 0 ) {
             char msg[256];
             snprintf(msg, sizeof(msg), "connect: %s", strerror(err));
-            char wire_copy[256];
+            char wire_copy[WIRE_MAX];
             strncpy(wire_copy, c->wire, sizeof(wire_copy));
             close_conn(c);
             send_error(r, lick_fd, wire_copy, msg);
@@ -1041,7 +1077,7 @@ main(int argc, char **argv)
         } else {
           int err = SSL_get_error(c->ssl, ret);
           if ( err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE ) {
-            char wire_copy[256];
+            char wire_copy[WIRE_MAX];
             strncpy(wire_copy, c->wire, sizeof(wire_copy));
             close_conn(c);
             send_error(r, lick_fd, wire_copy, "tls handshake failed");
@@ -1078,7 +1114,7 @@ main(int argc, char **argv)
       // Still open — send buffered output. After the read, so a peer
       // that closed gets %closed, not a failed send.
       if ( c->active && conn_pending(c) && conn_flush(c) < 0 ) {
-        char wire_copy[256];
+        char wire_copy[WIRE_MAX];
         strncpy(wire_copy, c->wire, sizeof(wire_copy));
         close_conn(c);
         send_error(r, lick_fd, wire_copy, "send failed");
