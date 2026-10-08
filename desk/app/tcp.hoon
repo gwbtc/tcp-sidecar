@@ -36,6 +36,7 @@
 ++  on-poke
   |=  [=mark =vase]
   ^-  (quip card _this)
+  ?>  =(src our):bowl
   ?>  ?=(%tcp-task mark)
   =/  cmd  !<(task:tcp vase)
   :_  this
@@ -95,6 +96,7 @@
 ++  on-watch
   |=  =path
   ^-  (quip card _this)
+  ?>  =(src our):bowl
   `this
 ++  on-leave  on-leave:def
 ++  on-peek   on-peek:def
