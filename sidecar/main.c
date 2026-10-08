@@ -663,8 +663,11 @@ handle_connect(ur_root_t *r, int lick_fd, ur_nref wire_ref, ur_nref rest)
   if ( !wire ) return;
   printf("[%s] task %%connect\n", wire);
 
-  if ( find_conn(wire) ) {
+  conn_t *old = find_conn(wire);
+  if ( old ) {
+    // The agent drops a wire on %error, so drop the connection too
     send_error(r, lick_fd, wire, "connection already exists");
+    close_conn(old);
     free(wire);
     return;
   }

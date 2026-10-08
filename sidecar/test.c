@@ -867,6 +867,31 @@ test_long_wire(void)
   close(srv);
 }
 
+// A second %connect on a live wire ends the first connection: the agent
+// drops the wire on %error, so the sidecar must not keep the socket
+static void
+test_wire_in_use(void)
+{
+  printf("wire in use\n");
+  uint16_t port;
+  int srv = tcp_listen(AF_INET, &port);
+  if ( srv < 0 ) die("tcp_listen");
+
+  peer_t p = open_conn("dup", 0, srv, port);
+  put_connect_if("dup", 1, 0x7f000001, port);
+  expect("error", "dup", "connection already exists");
+  check(peer_eof(&p), "the first connection closes");
+  check(tcp_accept(srv, 300) < 0, "and no second one opens");
+  peer_close(&p);
+
+  p = open_conn("dup", 0, srv, port);
+  check(1, "the wire can be used again");
+  put_close("dup");
+  expect("closed", "dup", NULL);
+  peer_close(&p);
+  close(srv);
+}
+
 // Issue 4: the sidecar starts before vere and waits for the socket
 static void
 test_late_vere(void)
@@ -947,6 +972,7 @@ main(void)
   test_basic(1);
   test_wide_atoms();
   test_long_wire();
+  test_wire_in_use();
   test_short_write(0);
   test_short_write(1);
   test_big_read(0);
