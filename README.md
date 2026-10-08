@@ -59,6 +59,10 @@ cp config.example.json config.json
 ./sidecar/tcp-sidecar /path/to/pier
 ```
 
+The sidecar can start before the ship. It tries the Lick socket once a second
+until the ship answers. When the ship stops, the sidecar closes every
+connection and waits for the ship to come back.
+
 ## Repo structure
 
 ```
@@ -77,6 +81,7 @@ desk/                    Urbit desk
 
 sidecar/                 C sidecar
   main.c                 Poll loop, connection management, noun helpers
+  test.c                 Tests: plays the ship and the remote peer
   ur/                    Vere's noun library (hashcons, jam/cue)
   Makefile
 ```
@@ -88,7 +93,15 @@ sidecar/                 C sidecar
 
 ## Testing
 
-With the sidecar running:
+The sidecar's own tests need no ship. They play both the ship's side of the
+Lick socket and the remote side of each connection, plain and TLS:
+
+```sh
+cd sidecar
+make test
+```
+
+The threads test the whole path through a ship. With the sidecar running:
 
 ```
 -tcp-sidecar!test-tcp-connect

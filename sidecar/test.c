@@ -801,6 +801,59 @@ test_big_read(int secure)
   close(srv);
 }
 
+// Issue 4: the sidecar starts before vere and waits for the socket
+static void
+test_late_vere(void)
+{
+  printf("vere starts late\n");
+  sidecar_start();
+  usleep(1500000);
+  check(sidecar_alive(), "the sidecar waits when there is no socket");
+
+  lick_listen();
+  check(lick_accept(WAIT_MS) == 0, "and connects once vere listens");
+}
+
+// Issue 4: vere stops; the sidecar drops its connections and reconnects
+static void
+test_vere_restart(void)
+{
+  printf("vere restarts\n");
+  uint16_t port;
+  int srv = tcp_listen(AF_INET, &port);
+  if ( srv < 0 ) die("tcp_listen");
+
+  peer_t p = open_conn("keep", 0, srv, port);
+
+  close(lick);
+  close(lick_srv);
+  unlink(LICK_PATH);
+  check(peer_eof(&p), "open connections close when vere goes");
+  peer_close(&p);
+
+  usleep(1500000);
+  check(sidecar_alive(), "the sidecar outlives vere");
+
+  lick_listen();
+  check(lick_accept(WAIT_MS) == 0, "and reconnects when vere is back");
+
+  // The old wire is free, and the new session works
+  p = open_conn("keep", 0, srv, port);
+  uint8_t buf[5];
+  put_send("keep", (uint8_t*)"again", 5);
+  check(peer_read(&p, buf, 5) == 5 && memcmp(buf, "again", 5) == 0,
+        "the new session carries data");
+  put_close("keep");
+  expect("closed", "keep", NULL);
+  peer_close(&p);
+
+  // Vere closes the connection but keeps listening
+  close(lick);
+  check(lick_accept(WAIT_MS) == 0, "reconnects after a dropped connection");
+
+  close(srv);
+}
+
 int
 main(void)
 {
@@ -821,9 +874,8 @@ main(void)
   r = ur_root_init();
 
   tls_init();
-  lick_listen();
-  sidecar_start();
-  if ( lick_accept(WAIT_MS) < 0 ) die("the sidecar did not connect");
+  test_late_vere();
+  if ( lick < 0 ) die("the sidecar did not connect");
 
   test_basic(0);
   test_basic(1);
@@ -832,6 +884,8 @@ main(void)
   test_short_write(1);
   test_big_read(0);
   test_big_read(1);
+  test_vere_restart();
+  test_basic(0);
 
   check(sidecar_alive(), "the sidecar is still running");
 

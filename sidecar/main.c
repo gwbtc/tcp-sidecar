@@ -214,8 +214,22 @@ read_exact(int fd, uint8_t *buf, size_t n)
   size_t done = 0;
   while ( done < n ) {
     ssize_t r = read(fd, buf + done, n - done);
+    if ( r < 0 && errno == EINTR ) continue;
     if ( r <= 0 ) return -1;
     done += r;
+  }
+  return 0;
+}
+
+static int
+write_exact(int fd, const uint8_t *buf, size_t n)
+{
+  size_t done = 0;
+  while ( done < n ) {
+    ssize_t w = write(fd, buf + done, n - done);
+    if ( w < 0 && errno == EINTR ) continue;
+    if ( w <= 0 ) return -1;
+    done += w;
   }
   return 0;
 }
@@ -242,7 +256,9 @@ send_gift(ur_root_t *r, int lick_fd, const char *tag, const char *wire,
 
   uint32_t msg_len;
   uint8_t *msg = make_lick_msg(r, msg_noun, &msg_len);
-  write(lick_fd, msg, msg_len);
+  // A failed write means vere is gone. The poll loop sees the closed
+  // socket on its next pass and reconnects; this gift has no reader.
+  write_exact(lick_fd, msg, msg_len);
   free(msg);
 }
 
@@ -810,6 +826,47 @@ handle_close(ur_root_t *r, int lick_fd, ur_nref wire_ref)
   free(wire);
 }
 
+// --- Lick connection ---
+
+// Connect to vere's Lick socket. Tries once a second until vere is there.
+static int
+lick_connect(const struct sockaddr_un *addr)
+{
+  int waiting = 0;
+
+  while ( 1 ) {
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if ( fd < 0 ) { perror("socket"); exit(1); }
+
+    if ( connect(fd, (struct sockaddr*)addr, sizeof(*addr)) == 0 ) {
+      printf("lick: connected\n");
+      return fd;
+    }
+    if ( !waiting ) {
+      printf("lick: connect: %s; trying again every second\n",
+             strerror(errno));
+      waiting = 1;
+    }
+    close(fd);
+    sleep(1);
+  }
+}
+
+// Vere went away. Close every connection, then wait for vere to return.
+// No gifts go out: nothing is left to read them, and the agent closes
+// its own wires when it hears %disconnect.
+static int
+lick_reconnect(int lick_fd, const struct sockaddr_un *addr)
+{
+  size_t n = 0;
+  for ( size_t i = 0; i < conns_len; i++ ) {
+    if ( conns[i].active ) { close_conn(&conns[i]); n++; }
+  }
+  printf("lick: connection closed; dropped %zu connections\n", n);
+  close(lick_fd);
+  return lick_connect(addr);
+}
+
 // --- Main loop ---
 
 int
@@ -846,19 +903,19 @@ main(int argc, char **argv)
   char sock_path[4096];
   snprintf(sock_path, sizeof(sock_path), "%s/.urb/dev/tcp/tcp", argv[1]);
 
-  int lick_fd = socket(AF_UNIX, SOCK_STREAM, 0);
-  if ( lick_fd < 0 ) { perror("socket"); return 1; }
-
   struct sockaddr_un addr = {0};
   addr.sun_family = AF_UNIX;
+  if ( strlen(sock_path) >= sizeof(addr.sun_path) ) {
+    // A truncated path would never connect, and the retry would hide it
+    fprintf(stderr, "socket path too long: %s\n"
+                    "run from inside the pier: cd <pier-path> && %s .\n",
+                    sock_path, argv[0]);
+    return 1;
+  }
   strncpy(addr.sun_path, sock_path, sizeof(addr.sun_path) - 1);
 
   printf("lick: connecting to %s\n", sock_path);
-  if ( connect(lick_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0 ) {
-    perror("connect");
-    return 1;
-  }
-  printf("lick: connected\n");
+  int lick_fd = lick_connect(&addr);
 
   ur_root_t *r = ur_root_init();
 
@@ -1031,13 +1088,11 @@ main(int argc, char **argv)
     }
 
     // Check for messages from Lick
-    if ( pfds[0].revents & POLLIN ) {
+    if ( pfds[0].revents & (POLLIN | POLLHUP | POLLERR) ) {
       uint8_t hdr[5];
       if ( read_exact(lick_fd, hdr, 5) < 0 ) {
-        printf("lick: connection closed\n");
-        free(pfds);
-        free(conn_pfd_map);
-        break;
+        lick_fd = lick_reconnect(lick_fd, &addr);
+        goto next;
       }
 
       uint32_t jam_len =
@@ -1048,11 +1103,9 @@ main(int argc, char **argv)
 
       uint8_t *jam_byt = malloc(jam_len);
       if ( read_exact(lick_fd, jam_byt, jam_len) < 0 ) {
-        printf("lick: read failed\n");
         free(jam_byt);
-        free(pfds);
-        free(conn_pfd_map);
-        break;
+        lick_fd = lick_reconnect(lick_fd, &addr);
+        goto next;
       }
 
       ur_nref noun;
