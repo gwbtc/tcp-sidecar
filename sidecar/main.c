@@ -9,6 +9,7 @@
 #include <errno.h>
 #include <poll.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <execinfo.h>
 #include <time.h>
 #include <openssl/ssl.h>
@@ -300,6 +301,12 @@ typedef struct {
   int          secure;
   char         host[256];
   uint64_t     deadline_ms;
+  uint8_t     *out;            // Output the socket has not taken yet
+  size_t       out_off;        // Start of the unsent bytes in out
+  size_t       out_len;        // End of the unsent bytes in out
+  size_t       out_cap;
+  int          out_wants_in;   // TLS must read before it can write more
+  int          closing;        // %close taken; flushing out, then closing
 } conn_t;
 
 static conn_t   *conns;
@@ -339,7 +346,92 @@ close_conn(conn_t *c)
 {
   if ( c->ssl ) { SSL_shutdown(c->ssl); SSL_free(c->ssl); c->ssl = NULL; }
   if ( c->sock >= 0 ) { close(c->sock); c->sock = -1; }
+  free(c->out);
+  c->out = NULL;
+  c->out_off = c->out_len = c->out_cap = 0;
   c->active = 0;
+}
+
+// --- Output buffer ---
+
+// Largest %send, and the most unsent output one connection may hold
+#define SEND_MAX (64u << 20)
+
+// How long a closed connection may take to flush its output
+#define DRAIN_MS 30000
+
+static size_t
+conn_pending(conn_t *c)
+{
+  return c->out_len - c->out_off;
+}
+
+// Append data to a connection's output. Returns -1 if it would exceed
+// SEND_MAX.
+static int
+conn_queue(conn_t *c, const uint8_t *data, size_t len)
+{
+  size_t have = conn_pending(c);
+  if ( len > SEND_MAX - have ) return -1;
+
+  if ( c->out_off ) {
+    memmove(c->out, c->out + c->out_off, have);
+    c->out_off = 0;
+    c->out_len = have;
+  }
+  if ( have + len > c->out_cap ) {
+    c->out_cap = have + len;
+    c->out = realloc(c->out, c->out_cap);
+  }
+  memcpy(c->out + have, data, len);
+  c->out_len = have + len;
+  return 0;
+}
+
+// Write as much output as the socket takes; the rest stays buffered.
+// Returns -1 if the connection failed.
+static int
+conn_flush(conn_t *c)
+{
+  c->out_wants_in = 0;
+
+  while ( conn_pending(c) ) {
+    size_t  left = conn_pending(c);
+    ssize_t n;
+
+    if ( c->ssl ) {
+      n = SSL_write(c->ssl, c->out + c->out_off,
+                    left > INT_MAX ? INT_MAX : (int)left);
+      if ( n <= 0 ) {
+        int err = SSL_get_error(c->ssl, n);
+        if ( err == SSL_ERROR_WANT_WRITE ) return 0;
+        if ( err == SSL_ERROR_WANT_READ ) { c->out_wants_in = 1; return 0; }
+        return -1;
+      }
+    } else {
+      n = write(c->sock, c->out + c->out_off, left);
+      if ( n < 0 ) {
+        if ( errno == EINTR ) continue;
+        if ( errno == EAGAIN || errno == EWOULDBLOCK ) return 0;
+        return -1;
+      }
+    }
+    c->out_off += n;
+  }
+
+  free(c->out);
+  c->out = NULL;
+  c->out_off = c->out_len = c->out_cap = 0;
+  return 0;
+}
+
+// What to poll an active connection for
+static short
+c_events(conn_t *c)
+{
+  short ev = c->closing ? 0 : POLLIN;
+  if ( conn_pending(c) ) ev |= c->out_wants_in ? POLLIN : POLLOUT;
+  return ev;
 }
 
 // --- Set fd non-blocking ---
@@ -352,9 +444,6 @@ set_nonblock(int fd)
 }
 
 // --- Handle commands from the agent ---
-
-// Largest %send, in bytes
-#define SEND_MAX (64u << 20)
 
 // Longest connect timeout, in milliseconds
 #define TIMEOUT_MAX 0xffffffffULL
@@ -627,18 +716,18 @@ handle_send(ur_root_t *r, int lick_fd, ur_nref wire_ref, ur_nref octs_ref)
     return;
   }
 
-  ssize_t sent;
-  if ( c->ssl ) {
-    sent = SSL_write(c->ssl, data, (int)len);
-  } else {
-    sent = write(c->sock, data, (size_t)len);
+  // Queue behind whatever is still unsent, so the bytes keep their order.
+  // A connection still connecting holds its output until it is up.
+  if ( conn_queue(c, data, (size_t)len) < 0 ) {
+    send_error(r, lick_fd, wire, "send buffer full");
+    close_conn(c);
   }
-
-  if ( sent <= 0 ) {
+  else if ( c->state == CONN_ACTIVE && conn_flush(c) < 0 ) {
     send_error(r, lick_fd, wire, "send failed");
     close_conn(c);
-  } else {
-    printf("[%s] sent %zd/%llu bytes\n", wire, sent, (unsigned long long)len);
+  }
+  else if ( conn_pending(c) ) {
+    printf("[%s] %zu bytes buffered\n", wire, conn_pending(c));
   }
 
   free(data);
@@ -653,7 +742,17 @@ handle_close(ur_root_t *r, int lick_fd, ur_nref wire_ref)
   conn_t *c = find_conn(wire);
 
   if ( c ) {
-    close_conn(c);
+    if ( c->state == CONN_ACTIVE && conn_pending(c) ) {
+      // Unsent output: keep the socket until it drains. The wire is free
+      // at once: no real wire is empty, so nothing finds this connection.
+      printf("[%s] closing after %zu buffered bytes\n", wire,
+             conn_pending(c));
+      c->closing = 1;
+      c->wire[0] = '\0';
+      c->deadline_ms = now_ms() + DRAIN_MS;
+    } else {
+      close_conn(c);
+    }
     send_closed(r, lick_fd, wire);
     printf("[%s] gift %%closed\n", wire);
   }
@@ -685,6 +784,9 @@ main(int argc, char **argv)
   ssl_ctx = SSL_CTX_new(TLS_client_method());
   SSL_CTX_set_default_verify_paths(ssl_ctx);
   SSL_CTX_set_verify(ssl_ctx, SSL_VERIFY_PEER, NULL);
+  // SSL_write may take part of a buffer, and conn_queue may move it
+  SSL_CTX_set_mode(ssl_ctx, SSL_MODE_ENABLE_PARTIAL_WRITE
+                          | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
 
   conns = NULL;
   conns_cap = 0;
@@ -718,7 +820,16 @@ main(int argc, char **argv)
     uint64_t ts = now_ms();
     for ( size_t i = 0; i < conns_len; i++ ) {
       conn_t *c = &conns[i];
-      if ( !c->active || c->state == CONN_ACTIVE ) continue;
+      if ( !c->active ) continue;
+      if ( c->closing ) {
+        if ( ts >= c->deadline_ms ) {
+          printf("closed connection dropped %zu unsent bytes\n",
+                 conn_pending(c));
+          close_conn(c);
+        }
+        continue;
+      }
+      if ( c->state == CONN_ACTIVE ) continue;
       if ( ts >= c->deadline_ms ) {
         printf("[%s] timeout (%s)\n", c->wire,
           c->state == CONN_CONNECTING ? "connect" : "tls");
@@ -748,7 +859,11 @@ main(int argc, char **argv)
       switch ( conns[i].state ) {
         case CONN_CONNECTING:  pfds[nfds].events = POLLOUT; break;
         case CONN_HANDSHAKING: pfds[nfds].events = POLLIN | POLLOUT; break;
-        case CONN_ACTIVE:      pfds[nfds].events = POLLIN; break;
+        case CONN_ACTIVE:
+          // Unsent output waits for the socket to take more, or for TLS
+          // to read first. A closing connection reads nothing else.
+          pfds[nfds].events = c_events(&conns[i]);
+          break;
       }
       nfds++;
     }
@@ -827,41 +942,56 @@ main(int argc, char **argv)
         continue;
       }
 
+      // Closed by the agent — flush, then drop the socket
+      if ( c->closing ) {
+        if ( conn_flush(c) < 0 || !conn_pending(c) ) close_conn(c);
+        continue;
+      }
+
       // Active connection — handle incoming data
-      if ( !(pfds[p].revents & (POLLIN | POLLHUP | POLLERR)) ) continue;
+      if ( pfds[p].revents & (POLLIN | POLLHUP | POLLERR) ) {
+        uint8_t buf[8192];
+        ssize_t n;
+        int again = 0;  // Nothing to read yet
 
-      uint8_t buf[8192];
-      ssize_t n;
-
-      if ( c->ssl ) {
-        n = SSL_read(c->ssl, buf, sizeof(buf));
-        if ( n <= 0 ) {
-          int err = SSL_get_error(c->ssl, n);
-          if ( err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE ) {
-            continue;
+        if ( c->ssl ) {
+          n = SSL_read(c->ssl, buf, sizeof(buf));
+          if ( n <= 0 ) {
+            int err = SSL_get_error(c->ssl, n);
+            again = ( err == SSL_ERROR_WANT_READ
+                   || err == SSL_ERROR_WANT_WRITE );
           }
+        } else {
+          n = read(c->sock, buf, sizeof(buf));
+          again = ( n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) );
         }
-      } else {
-        n = read(c->sock, buf, sizeof(buf));
-        if ( n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) ) {
-          continue;
+
+        if ( n > 0 ) {
+          printf("[%s] gift %%receive %zd bytes\n", c->wire, n);
+          send_receive(r, lick_fd, c->wire, buf, n);
         }
+        else if ( !again ) {
+          printf("[%s] remote closed -> gift %%closed\n", c->wire);
+          char wire_copy[256];
+          strncpy(wire_copy, c->wire, sizeof(wire_copy));
+          close_conn(c);
+          send_closed(r, lick_fd, wire_copy);
+        }
+
+        ur_root_free(r);
+        r = ur_root_init();
       }
 
-      if ( n > 0 ) {
-        printf("[%s] gift %%receive %zd bytes\n", c->wire, n);
-        send_receive(r, lick_fd, c->wire, buf, n);
-      }
-      else {
-        printf("[%s] remote closed -> gift %%closed\n", c->wire);
+      // Still open — send buffered output. After the read, so a peer
+      // that closed gets %closed, not a failed send.
+      if ( c->active && conn_pending(c) && conn_flush(c) < 0 ) {
         char wire_copy[256];
         strncpy(wire_copy, c->wire, sizeof(wire_copy));
         close_conn(c);
-        send_closed(r, lick_fd, wire_copy);
+        send_error(r, lick_fd, wire_copy, "send failed");
+        ur_root_free(r);
+        r = ur_root_init();
       }
-
-      ur_root_free(r);
-      r = ur_root_init();
     }
 
     // Check for messages from Lick

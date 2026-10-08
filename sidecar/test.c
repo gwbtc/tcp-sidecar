@@ -20,11 +20,14 @@
 #include <sys/wait.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <openssl/ssl.h>
+#include <openssl/x509v3.h>
 
 #include "ur/ur.h"
 
 #define LICK_PATH ".urb/dev/tcp/tcp"
 #define LOG_PATH  "sidecar.log"
+#define CERT_PATH "cert.pem"
 #define WAIT_MS   5000
 
 static char       pier[PATH_MAX];
@@ -33,6 +36,7 @@ static pid_t      sidecar = -1;
 static int        lick_srv = -1;
 static int        lick = -1;
 static ur_root_t *r;
+static SSL_CTX   *tls;
 static int        checks;
 static int        fails;
 
@@ -50,6 +54,7 @@ cleanup(void)
   rmdir(".urb/dev/tcp");
   rmdir(".urb/dev");
   rmdir(".urb");
+  unlink(CERT_PATH);
   if ( fails == 0 ) {
     unlink(LOG_PATH);
     rmdir(pier);
@@ -230,19 +235,26 @@ put(ur_nref task)
   r = ur_root_init();
 }
 
-// [%connect wire [secure fief] timeout=(unit @ud)], plain tcp
+// [%connect wire [secure fief] timeout=(unit @ud)]; secure is a loobean
 static void
-put_connect(const char *w, ur_nref fief_ref, ur_nref timeout)
+put_target(const char *w, int secure, ur_nref fief_ref, ur_nref timeout)
 {
-  ur_nref target = ur_cons(r, 1, fief_ref);
+  ur_nref target = ur_cons(r, secure, fief_ref);
   put(ur_cons(r, cord("connect"),
         ur_cons(r, wire(w), ur_cons(r, target, timeout))));
 }
 
+// Plain tcp
 static void
-put_connect_if(const char *w, uint32_t ip, uint16_t port)
+put_connect(const char *w, ur_nref fief_ref, ur_nref timeout)
 {
-  put_connect(w, fief("if", ur_coin64(r, ip), ur_coin64(r, port)), 0);
+  put_target(w, 1, fief_ref, timeout);
+}
+
+static void
+put_connect_if(const char *w, int secure, uint32_t ip, uint16_t port)
+{
+  put_target(w, secure, fief("if", ur_coin64(r, ip), ur_coin64(r, port)), 0);
 }
 
 // [%send wire [len data]]
@@ -427,41 +439,173 @@ tcp_accept(int srv, int ms)
   return accept(srv, NULL, NULL);
 }
 
-// Open a plain connection on /w through the sidecar; returns the peer fd
-static int
-open_conn(const char *w, int srv, uint16_t port)
+// The remote end of a connection the sidecar opened
+typedef struct {
+  int  fd;
+  SSL *ssl;  // NULL for plain tcp
+} peer_t;
+
+// Make a key and a self-signed certificate for 127.0.0.1, and write the
+// certificate where the sidecar will look for its roots
+static void
+tls_init(void)
 {
-  put_connect_if(w, 0x7f000001, port);
+  EVP_PKEY *key = NULL;
+  EVP_PKEY_CTX *kctx = EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, NULL);
+  if (  !kctx
+     || EVP_PKEY_keygen_init(kctx) <= 0
+     || EVP_PKEY_CTX_set_rsa_keygen_bits(kctx, 2048) <= 0
+     || EVP_PKEY_keygen(kctx, &key) <= 0 ) {
+    die("keygen");
+  }
+  EVP_PKEY_CTX_free(kctx);
+
+  X509 *crt = X509_new();
+  ASN1_INTEGER_set(X509_get_serialNumber(crt), 1);
+  X509_gmtime_adj(X509_getm_notBefore(crt), -3600);
+  X509_gmtime_adj(X509_getm_notAfter(crt), 3600);
+  X509_set_pubkey(crt, key);
+  X509_NAME *name = X509_get_subject_name(crt);
+  X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
+                             (unsigned char*)"127.0.0.1", -1, -1, 0);
+  X509_set_issuer_name(crt, name);
+  X509_EXTENSION *san = X509V3_EXT_conf_nid(NULL, NULL, NID_subject_alt_name,
+                                            "IP:127.0.0.1");
+  X509_add_ext(crt, san, -1);
+  X509_EXTENSION_free(san);
+  if ( !X509_sign(crt, key, EVP_sha256()) ) die("sign");
+
+  FILE *f = fopen(CERT_PATH, "w");
+  if ( !f || !PEM_write_X509(f, crt) ) die(CERT_PATH);
+  fclose(f);
+  setenv("SSL_CERT_FILE", CERT_PATH, 1);
+
+  tls = SSL_CTX_new(TLS_server_method());
+  if (  !tls
+     || SSL_CTX_use_certificate(tls, crt) != 1
+     || SSL_CTX_use_PrivateKey(tls, key) != 1 ) {
+    die("tls context");
+  }
+  X509_free(crt);
+  EVP_PKEY_free(key);
+}
+
+// Open a connection on /w through the sidecar, plain or TLS
+static peer_t
+open_conn(const char *w, int secure, int srv, uint16_t port)
+{
+  peer_t p = { -1, NULL };
+  put_connect_if(w, secure ? 0 : 1, 0x7f000001, port);
+  p.fd = tcp_accept(srv, WAIT_MS);
+  if ( p.fd < 0 ) die("accept");
+  if ( secure ) {
+    p.ssl = SSL_new(tls);
+    SSL_set_fd(p.ssl, p.fd);
+    if ( SSL_accept(p.ssl) != 1 ) die("tls accept");
+  }
   expect("connected", w, NULL);
-  int fd = tcp_accept(srv, WAIT_MS);
-  if ( fd < 0 ) die("accept");
-  return fd;
+  return p;
+}
+
+static void
+peer_close(peer_t *p)
+{
+  if ( p->ssl ) SSL_free(p->ssl);
+  close(p->fd);
+}
+
+static void
+peer_write(peer_t *p, const uint8_t *buf, size_t n)
+{
+  if ( !p->ssl ) {
+    write_all(p->fd, buf, n);
+  }
+  else if ( SSL_write(p->ssl, buf, (int)n) != (int)n ) {
+    die("tls write");
+  }
+}
+
+// Read up to n bytes. Returns the count: less than n on timeout or EOF.
+static size_t
+peer_read(peer_t *p, uint8_t *buf, size_t n)
+{
+  if ( !p->ssl ) return read_n(p->fd, buf, n, WAIT_MS);
+
+  size_t done = 0;
+  while ( done < n ) {
+    struct pollfd pfd = { .fd = p->fd, .events = POLLIN };
+    if ( !SSL_pending(p->ssl) && poll(&pfd, 1, WAIT_MS) <= 0 ) break;
+    int got = SSL_read(p->ssl, buf + done, (int)(n - done));
+    if ( got <= 0 ) break;
+    done += got;
+  }
+  return done;
+}
+
+// Returns 1 if the sidecar closed the connection within WAIT_MS
+static int
+peer_eof(peer_t *p)
+{
+  uint8_t b;
+  return peer_read(p, &b, 1) == 0;
+}
+
+// --- Test data ---
+
+// Byte i of a stream no shorter run of which repeats
+static uint8_t
+pattern(size_t i)
+{
+  return (uint8_t)(((uint32_t)i * 2654435761u) >> 24);
+}
+
+static uint8_t*
+make_pattern(size_t start, size_t n)
+{
+  uint8_t *buf = malloc(n);
+  for ( size_t i = 0; i < n; i++ ) buf[i] = pattern(start + i);
+  return buf;
+}
+
+// Read n bytes from the peer and compare them with the pattern from start
+static int
+peer_reads_pattern(peer_t *p, size_t start, size_t n)
+{
+  uint8_t *buf = malloc(n);
+  size_t got = peer_read(p, buf, n);
+  int ok = got == n;
+  for ( size_t i = 0; ok && i < n; i++ ) {
+    if ( buf[i] != pattern(start + i) ) ok = 0;
+  }
+  if ( got != n ) printf("        read %zu of %zu bytes\n", got, n);
+  free(buf);
+  return ok;
 }
 
 // --- Tests ---
 
 // Connect, send, receive, close
 static void
-test_basic(void)
+test_basic(int secure)
 {
-  printf("basic\n");
+  printf("basic, %s\n", secure ? "tls" : "plain");
   uint16_t port;
   int srv = tcp_listen(AF_INET, &port);
   if ( srv < 0 ) die("tcp_listen");
 
-  int fd = open_conn("basic", srv, port);
+  peer_t p = open_conn("basic", secure, srv, port);
 
   uint8_t buf[16];
   put_send("basic", (uint8_t*)"hello", 5);
-  check(read_n(fd, buf, 5, WAIT_MS) == 5 && memcmp(buf, "hello", 5) == 0,
+  check(peer_read(&p, buf, 5) == 5 && memcmp(buf, "hello", 5) == 0,
         "peer reads what %send carried");
 
   // octs longer than the atom: the trailing zeros are part of the data
   put_octs("basic", ur_coin64(r, 5), cord("hi"));
-  check(read_n(fd, buf, 5, WAIT_MS) == 5 && memcmp(buf, "hi\0\0\0", 5) == 0,
+  check(peer_read(&p, buf, 5) == 5 && memcmp(buf, "hi\0\0\0", 5) == 0,
         "octs keep their trailing zeros");
 
-  write_all(fd, (uint8_t*)"world", 5);
+  peer_write(&p, (uint8_t*)"world", 5);
   gift_t g;
   check(get(&g, WAIT_MS) == 0 && strcmp(g.tag, "receive") == 0
         && g.len == 5 && memcmp(g.data, "world", 5) == 0,
@@ -470,9 +614,9 @@ test_basic(void)
 
   put_close("basic");
   expect("closed", "basic", NULL);
-  check(saw_eof(fd, WAIT_MS), "peer sees the close");
+  check(peer_eof(&p), "peer sees the close");
 
-  close(fd);
+  peer_close(&p);
   close(srv);
 }
 
@@ -556,6 +700,53 @@ test_wide_atoms(void)
   close(srv);
 }
 
+// Issue 7: a %send larger than the socket takes at once arrives whole
+static void
+test_short_write(int secure)
+{
+  printf("short write, %s\n", secure ? "tls" : "plain");
+  uint16_t port;
+  int srv = tcp_listen(AF_INET, &port);
+  if ( srv < 0 ) die("tcp_listen");
+
+  // 8 MB overruns any loopback socket buffer while the peer is not reading
+  size_t big = 8u << 20;
+  uint8_t *data = make_pattern(0, big + 4);
+
+  peer_t p = open_conn("big", secure, srv, port);
+
+  // The second %send must land behind the buffered rest of the first
+  put_send("big", data, big);
+  put_send("big", data + big, 4);
+  check(peer_reads_pattern(&p, 0, big + 4), "peer reads every byte in order");
+
+  // No %error on the way: the connection still works in both directions
+  peer_write(&p, (uint8_t*)"ok", 2);
+  gift_t g;
+  check(get(&g, WAIT_MS) == 0 && strcmp(g.tag, "receive") == 0
+        && g.len == 2 && memcmp(g.data, "ok", 2) == 0,
+        "the connection survives the short write");
+  free(g.data);
+
+  // %close right behind a %send: the wire is free at once, and the
+  // socket closes only after the buffered bytes are out
+  put_send("big", data, big);
+  put_close("big");
+  expect("closed", "big", NULL);
+  check(peer_reads_pattern(&p, 0, big), "%close flushes what %send buffered");
+  check(peer_eof(&p), "then the peer sees the close");
+  peer_close(&p);
+
+  p = open_conn("big", secure, srv, port);
+  check(1, "the wire can be used again");
+  put_close("big");
+  expect("closed", "big", NULL);
+  peer_close(&p);
+
+  free(data);
+  close(srv);
+}
+
 int
 main(void)
 {
@@ -575,12 +766,16 @@ main(void)
 
   r = ur_root_init();
 
+  tls_init();
   lick_listen();
   sidecar_start();
   if ( lick_accept(WAIT_MS) < 0 ) die("the sidecar did not connect");
 
-  test_basic();
+  test_basic(0);
+  test_basic(1);
   test_wide_atoms();
+  test_short_write(0);
+  test_short_write(1);
 
   check(sidecar_alive(), "the sidecar is still running");
 
