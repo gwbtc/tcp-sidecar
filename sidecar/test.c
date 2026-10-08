@@ -747,6 +747,60 @@ test_short_write(int secure)
   close(srv);
 }
 
+// Issue 5: a large message arrives in a few gifts, not one per 8 KB
+static void
+test_big_read(int secure)
+{
+  printf("big read, %s\n", secure ? "tls" : "plain");
+  uint16_t port;
+  int srv = tcp_listen(AF_INET, &port);
+  if ( srv < 0 ) die("tcp_listen");
+
+  size_t big = 4u << 20;
+  peer_t p = open_conn("blk", secure, srv, port);
+
+  // Hold the sidecar still while the first bytes pile up in its socket,
+  // as they do when vere is slow to take gifts. A child writes, so this
+  // process can read gifts while the write is in flight. The child holds
+  // the only open end, so its exit closes the connection.
+  kill(sidecar, SIGSTOP);
+  pid_t writer = fork();
+  if ( writer < 0 ) die("fork");
+  if ( writer == 0 ) {
+    uint8_t *data = make_pattern(0, big);
+    peer_write(&p, data, big);
+    _exit(0);
+  }
+  peer_close(&p);
+  usleep(300000);
+  kill(sidecar, SIGCONT);
+
+  size_t total = 0, gifts = 0, most = 0;
+  int ordered = 1;
+  gift_t g;
+  while ( total < big && get(&g, WAIT_MS) == 0 ) {
+    if ( strcmp(g.tag, "receive") != 0 ) { free(g.data); break; }
+    for ( size_t i = 0; i < g.len; i++ ) {
+      if ( g.data[i] != pattern(total + i) ) ordered = 0;
+    }
+    total += g.len;
+    gifts++;
+    if ( g.len > most ) most = g.len;
+    free(g.data);
+  }
+  printf("        %zu bytes in %zu gifts, largest %zu\n", total, gifts, most);
+
+  check(total == big && ordered, "%receive carries every byte in order");
+  check(gifts <= big / 32768, "at least 32 KB a gift on average");
+  check(most <= (1u << 20), "no gift over 1 MB");
+
+  // The peer closed right behind its last byte: %closed comes after it
+  waitpid(writer, NULL, 0);
+  expect("closed", "blk", NULL);
+
+  close(srv);
+}
+
 int
 main(void)
 {
@@ -776,6 +830,8 @@ main(void)
   test_wide_atoms();
   test_short_write(0);
   test_short_write(1);
+  test_big_read(0);
+  test_big_read(1);
 
   check(sidecar_alive(), "the sidecar is still running");
 

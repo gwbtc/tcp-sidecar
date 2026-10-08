@@ -307,6 +307,7 @@ typedef struct {
   size_t       out_cap;
   int          out_wants_in;   // TLS must read before it can write more
   int          closing;        // %close taken; flushing out, then closing
+  int          in_more;        // Last read filled the buffer; read again
 } conn_t;
 
 static conn_t   *conns;
@@ -349,6 +350,7 @@ close_conn(conn_t *c)
   free(c->out);
   c->out = NULL;
   c->out_off = c->out_len = c->out_cap = 0;
+  c->in_more = 0;
   c->active = 0;
 }
 
@@ -423,6 +425,53 @@ conn_flush(conn_t *c)
   c->out = NULL;
   c->out_off = c->out_len = c->out_cap = 0;
   return 0;
+}
+
+// --- Input ---
+
+// Most bytes one %receive gift carries. Every gift is an Arvo event, so
+// a small buffer turns one large message into hundreds of events.
+#define RECV_MAX (1u << 20)
+
+// Static: the poll loop is single-threaded
+static uint8_t recv_buf[RECV_MAX];
+
+// Read into recv_buf until the socket is empty or the buffer is full.
+// Returns the byte count. Closes the connection on EOF or error; the
+// wire stays in c->wire for the caller's gift.
+static size_t
+conn_read(conn_t *c)
+{
+  size_t got = 0;
+  int    eof = 0;
+
+  while ( got < RECV_MAX ) {
+    ssize_t n;
+
+    if ( c->ssl ) {
+      n = SSL_read(c->ssl, recv_buf + got, (int)(RECV_MAX - got));
+      if ( n <= 0 ) {
+        int err = SSL_get_error(c->ssl, n);
+        eof = ( err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE );
+        break;
+      }
+    } else {
+      n = read(c->sock, recv_buf + got, RECV_MAX - got);
+      if ( n < 0 && errno == EINTR ) continue;
+      if ( n <= 0 ) {
+        eof = ( n == 0 || (errno != EAGAIN && errno != EWOULDBLOCK) );
+        break;
+      }
+    }
+    got += n;
+  }
+
+  // A full buffer may leave bytes behind, and TLS can hold them where
+  // poll does not see them: come straight back
+  c->in_more = ( got == RECV_MAX );
+
+  if ( eof ) close_conn(c);
+  return got;
 }
 
 // What to poll an active connection for
@@ -748,6 +797,7 @@ handle_close(ur_root_t *r, int lick_fd, ur_nref wire_ref)
       printf("[%s] closing after %zu buffered bytes\n", wire,
              conn_pending(c));
       c->closing = 1;
+      c->in_more = 0;
       c->wire[0] = '\0';
       c->deadline_ms = now_ms() + DRAIN_MS;
     } else {
@@ -852,9 +902,12 @@ main(int argc, char **argv)
     pfds[nfds].events = POLLIN;
     nfds++;
 
+    int wait_ms = 100;
+
     for ( size_t i = 0; i < conns_len; i++ ) {
       if ( !conns[i].active ) continue;
       conn_pfd_map[nfds - 1] = i;
+      if ( conns[i].in_more ) wait_ms = 0;
       pfds[nfds].fd = conns[i].sock;
       switch ( conns[i].state ) {
         case CONN_CONNECTING:  pfds[nfds].events = POLLOUT; break;
@@ -868,7 +921,7 @@ main(int argc, char **argv)
       nfds++;
     }
 
-    int ready = poll(pfds, nfds, 100);
+    int ready = poll(pfds, nfds, wait_ms);
     if ( ready < 0 ) {
       if ( errno == EINTR ) goto next;
       perror("poll");
@@ -879,10 +932,10 @@ main(int argc, char **argv)
 
     // Handle connection events
     for ( int p = 1; p < nfds; p++ ) {
-      if ( !pfds[p].revents ) continue;
-
       size_t ci = conn_pfd_map[p - 1];
       conn_t *c = &conns[ci];
+
+      if ( !pfds[p].revents && !c->in_more ) continue;
 
       // TCP connect completing
       if ( c->state == CONN_CONNECTING ) {
@@ -949,33 +1002,16 @@ main(int argc, char **argv)
       }
 
       // Active connection — handle incoming data
-      if ( pfds[p].revents & (POLLIN | POLLHUP | POLLERR) ) {
-        uint8_t buf[8192];
-        ssize_t n;
-        int again = 0;  // Nothing to read yet
+      if ( c->in_more || (pfds[p].revents & (POLLIN | POLLHUP | POLLERR)) ) {
+        size_t got = conn_read(c);
 
-        if ( c->ssl ) {
-          n = SSL_read(c->ssl, buf, sizeof(buf));
-          if ( n <= 0 ) {
-            int err = SSL_get_error(c->ssl, n);
-            again = ( err == SSL_ERROR_WANT_READ
-                   || err == SSL_ERROR_WANT_WRITE );
-          }
-        } else {
-          n = read(c->sock, buf, sizeof(buf));
-          again = ( n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) );
+        if ( got ) {
+          printf("[%s] gift %%receive %zu bytes\n", c->wire, got);
+          send_receive(r, lick_fd, c->wire, recv_buf, got);
         }
-
-        if ( n > 0 ) {
-          printf("[%s] gift %%receive %zd bytes\n", c->wire, n);
-          send_receive(r, lick_fd, c->wire, buf, n);
-        }
-        else if ( !again ) {
+        if ( !c->active ) {
           printf("[%s] remote closed -> gift %%closed\n", c->wire);
-          char wire_copy[256];
-          strncpy(wire_copy, c->wire, sizeof(wire_copy));
-          close_conn(c);
-          send_closed(r, lick_fd, wire_copy);
+          send_closed(r, lick_fd, c->wire);
         }
 
         ur_root_free(r);
