@@ -9,6 +9,7 @@
 #include <errno.h>
 #include <poll.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <execinfo.h>
 #include <time.h>
 #include <openssl/ssl.h>
@@ -98,11 +99,27 @@ read_bytes(ur_root_t *r, ur_nref ref, size_t *out_len)
   return NULL;
 }
 
-static uint64_t
-read_atom(ur_nref ref)
+// Read an atom of at most 64 bits. Returns -1 for a cell or a wider atom.
+static int
+read_atom(ur_root_t *r, ur_nref ref, uint64_t *out)
 {
-  if ( ur_nref_tag(ref) == ur_direct ) return ur_nref_idx(ref);
-  return 0;
+  if ( ur_nref_tag(ref) == ur_direct ) {
+    *out = ur_nref_idx(ref);
+    return 0;
+  }
+  if ( ur_nref_tag(ref) == ur_iatom ) {
+    uint64_t idx = ur_nref_idx(ref);
+    uint64_t len = r->atoms.lens[idx];
+    uint8_t *byt = r->atoms.bytes[idx];
+    if ( len > 8 ) return -1;
+    uint64_t val = 0;
+    for ( uint64_t i = 0; i < len; i++ ) {
+      val |= (uint64_t)byt[i] << (8 * i);
+    }
+    *out = val;
+    return 0;
+  }
+  return -1;
 }
 
 static int
@@ -115,21 +132,34 @@ read_cell(ur_root_t *r, ur_nref ref, ur_nref *head, ur_nref *tail)
   return 0;
 }
 
-// Read a wire (path) from a noun — returns malloc'd string like "/foo/bar"
+// Longest wire the sidecar tracks, as a string with its NUL, and the
+// most segments. conn_t.wire and make_wire are sized to these.
+#define WIRE_MAX  256
+#define WIRE_SEGS 64
+
+// Read a wire (path) from a noun — returns malloc'd string like "/foo/bar",
+// or NULL if the wire is over WIRE_MAX or WIRE_SEGS
 static char*
 read_wire(ur_root_t *r, ur_nref ref)
 {
   // A wire is a list of cords: [%foo %bar ~] -> "/foo/bar"
-  char buf[1024] = {0};
+  char buf[WIRE_MAX] = {0};
   size_t pos = 0;
+  int nseg = 0;
   ur_nref cur = ref;
 
   while ( ur_nref_tag(cur) == ur_icell ) {
     ur_nref h, t;
     read_cell(r, cur, &h, &t);
     char *seg = read_cord(r, h);
-    int n = snprintf(buf + pos, sizeof(buf) - pos, "/%s", seg);
-    pos += n;
+    size_t len = strlen(seg);
+    if ( ++nseg > WIRE_SEGS || pos + 1 + len >= sizeof(buf) ) {
+      free(seg);
+      return NULL;
+    }
+    buf[pos++] = '/';
+    memcpy(buf + pos, seg, len);
+    pos += len;
     free(seg);
     cur = t;
   }
@@ -144,7 +174,7 @@ make_wire(ur_root_t *r, const char *path)
 {
   // Parse "/foo/bar" into [%foo %bar ~]
   // We store segments then build the list in reverse
-  const char *segs[64];
+  const char *segs[WIRE_SEGS];
   int nseg = 0;
   const char *p = path;
 
@@ -197,21 +227,35 @@ read_exact(int fd, uint8_t *buf, size_t n)
   size_t done = 0;
   while ( done < n ) {
     ssize_t r = read(fd, buf + done, n - done);
+    if ( r < 0 && errno == EINTR ) continue;
     if ( r <= 0 ) return -1;
     done += r;
   }
   return 0;
 }
 
+static int
+write_exact(int fd, const uint8_t *buf, size_t n)
+{
+  size_t done = 0;
+  while ( done < n ) {
+    ssize_t w = write(fd, buf + done, n - done);
+    if ( w < 0 && errno == EINTR ) continue;
+    if ( w <= 0 ) return -1;
+    done += w;
+  }
+  return 0;
+}
+
 // --- Send gift nouns over Lick ---
 
+// Send a gift on a wire given as a noun
 static void
-send_gift(ur_root_t *r, int lick_fd, const char *tag, const char *wire,
-          ur_nref extra)
+send_gift_on(ur_root_t *r, int lick_fd, const char *tag, ur_nref n_wire,
+             ur_nref extra)
 {
   ur_nref n_mark = make_cord(r, "tcp-gift");
   ur_nref n_tag  = make_cord(r, tag);
-  ur_nref n_wire = make_wire(r, wire);
   ur_nref payload;
 
   if ( extra == (ur_nref)-1 ) {
@@ -225,8 +269,17 @@ send_gift(ur_root_t *r, int lick_fd, const char *tag, const char *wire,
 
   uint32_t msg_len;
   uint8_t *msg = make_lick_msg(r, msg_noun, &msg_len);
-  write(lick_fd, msg, msg_len);
+  // A failed write means vere is gone. The poll loop sees the closed
+  // socket on its next pass and reconnects; this gift has no reader.
+  write_exact(lick_fd, msg, msg_len);
   free(msg);
+}
+
+static void
+send_gift(ur_root_t *r, int lick_fd, const char *tag, const char *wire,
+          ur_nref extra)
+{
+  send_gift_on(r, lick_fd, tag, make_wire(r, wire), extra);
 }
 
 static void
@@ -259,6 +312,19 @@ send_error(ur_root_t *r, int lick_fd, const char *wire, const char *msg)
   send_gift(r, lick_fd, "error", wire, n_msg);
 }
 
+// Read a task's wire. A wire too long to track gets %error, sent on the
+// wire as the task gave it, and NULL comes back.
+static char*
+task_wire(ur_root_t *r, int lick_fd, ur_nref wire_ref)
+{
+  char *wire = read_wire(r, wire_ref);
+  if ( !wire ) {
+    printf("task on a wire too long to track -> gift %%error\n");
+    send_gift_on(r, lick_fd, "error", wire_ref, make_cord(r, "wire too long"));
+  }
+  return wire;
+}
+
 // --- Connection state ---
 
 static uint64_t
@@ -280,10 +346,17 @@ typedef struct {
   conn_state_t state;
   int          sock;
   SSL         *ssl;
-  char         wire[256];
+  char         wire[WIRE_MAX];
   int          secure;
   char         host[256];
   uint64_t     deadline_ms;
+  uint8_t     *out;            // Output the socket has not taken yet
+  size_t       out_off;        // Start of the unsent bytes in out
+  size_t       out_len;        // End of the unsent bytes in out
+  size_t       out_cap;
+  int          out_wants_in;   // TLS must read before it can write more
+  int          closing;        // %close taken; flushing out, then closing
+  int          in_more;        // Last read filled the buffer; read again
 } conn_t;
 
 static conn_t   *conns;
@@ -323,7 +396,140 @@ close_conn(conn_t *c)
 {
   if ( c->ssl ) { SSL_shutdown(c->ssl); SSL_free(c->ssl); c->ssl = NULL; }
   if ( c->sock >= 0 ) { close(c->sock); c->sock = -1; }
+  free(c->out);
+  c->out = NULL;
+  c->out_off = c->out_len = c->out_cap = 0;
+  c->in_more = 0;
   c->active = 0;
+}
+
+// --- Output buffer ---
+
+// Largest %send, and the most unsent output one connection may hold
+#define SEND_MAX (64u << 20)
+
+// How long a closed connection may take to flush its output
+#define DRAIN_MS 30000
+
+static size_t
+conn_pending(conn_t *c)
+{
+  return c->out_len - c->out_off;
+}
+
+// Append data to a connection's output. Returns -1 if it would exceed
+// SEND_MAX.
+static int
+conn_queue(conn_t *c, const uint8_t *data, size_t len)
+{
+  size_t have = conn_pending(c);
+  if ( len > SEND_MAX - have ) return -1;
+
+  if ( c->out_off ) {
+    memmove(c->out, c->out + c->out_off, have);
+    c->out_off = 0;
+    c->out_len = have;
+  }
+  if ( have + len > c->out_cap ) {
+    c->out_cap = have + len;
+    c->out = realloc(c->out, c->out_cap);
+  }
+  memcpy(c->out + have, data, len);
+  c->out_len = have + len;
+  return 0;
+}
+
+// Write as much output as the socket takes; the rest stays buffered.
+// Returns -1 if the connection failed.
+static int
+conn_flush(conn_t *c)
+{
+  c->out_wants_in = 0;
+
+  while ( conn_pending(c) ) {
+    size_t  left = conn_pending(c);
+    ssize_t n;
+
+    if ( c->ssl ) {
+      n = SSL_write(c->ssl, c->out + c->out_off,
+                    left > INT_MAX ? INT_MAX : (int)left);
+      if ( n <= 0 ) {
+        int err = SSL_get_error(c->ssl, n);
+        if ( err == SSL_ERROR_WANT_WRITE ) return 0;
+        if ( err == SSL_ERROR_WANT_READ ) { c->out_wants_in = 1; return 0; }
+        return -1;
+      }
+    } else {
+      n = write(c->sock, c->out + c->out_off, left);
+      if ( n < 0 ) {
+        if ( errno == EINTR ) continue;
+        if ( errno == EAGAIN || errno == EWOULDBLOCK ) return 0;
+        return -1;
+      }
+    }
+    c->out_off += n;
+  }
+
+  free(c->out);
+  c->out = NULL;
+  c->out_off = c->out_len = c->out_cap = 0;
+  return 0;
+}
+
+// --- Input ---
+
+// Most bytes one %receive gift carries. Every gift is an Arvo event, so
+// a small buffer turns one large message into hundreds of events.
+#define RECV_MAX (1u << 20)
+
+// Static: the poll loop is single-threaded
+static uint8_t recv_buf[RECV_MAX];
+
+// Read into recv_buf until the socket is empty or the buffer is full.
+// Returns the byte count. Closes the connection on EOF or error; the
+// wire stays in c->wire for the caller's gift.
+static size_t
+conn_read(conn_t *c)
+{
+  size_t got = 0;
+  int    eof = 0;
+
+  while ( got < RECV_MAX ) {
+    ssize_t n;
+
+    if ( c->ssl ) {
+      n = SSL_read(c->ssl, recv_buf + got, (int)(RECV_MAX - got));
+      if ( n <= 0 ) {
+        int err = SSL_get_error(c->ssl, n);
+        eof = ( err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE );
+        break;
+      }
+    } else {
+      n = read(c->sock, recv_buf + got, RECV_MAX - got);
+      if ( n < 0 && errno == EINTR ) continue;
+      if ( n <= 0 ) {
+        eof = ( n == 0 || (errno != EAGAIN && errno != EWOULDBLOCK) );
+        break;
+      }
+    }
+    got += n;
+  }
+
+  // A full buffer may leave bytes behind, and TLS can hold them where
+  // poll does not see them: come straight back
+  c->in_more = ( got == RECV_MAX );
+
+  if ( eof ) close_conn(c);
+  return got;
+}
+
+// What to poll an active connection for
+static short
+c_events(conn_t *c)
+{
+  short ev = c->closing ? 0 : POLLIN;
+  if ( conn_pending(c) ) ev |= c->out_wants_in ? POLLIN : POLLOUT;
+  return ev;
 }
 
 // --- Set fd non-blocking ---
@@ -337,124 +543,170 @@ set_nonblock(int fd)
 
 // --- Handle commands from the agent ---
 
-static void
-handle_connect(ur_root_t *r, int lick_fd, ur_nref wire_ref, ur_nref target_ref,
-               uint64_t timeout_ms)
+// Longest connect timeout, in milliseconds
+#define TIMEOUT_MAX 0xffffffffULL
+
+// Read a port. Returns -1 unless it is an atom from 1 to 65535.
+static int
+read_port(ur_root_t *r, ur_nref ref, uint64_t *port)
 {
-  char *wire = read_wire(r, wire_ref);
-  printf("[%s] task %%connect\n", wire);
+  if ( read_atom(r, ref, port) < 0 ) return -1;
+  if ( *port == 0 || *port > 65535 ) return -1;
+  return 0;
+}
 
-  if ( find_conn(wire) ) {
-    send_error(r, lick_fd, wire, "connection already exists");
-    free(wire);
-    return;
-  }
-
-  conn_t *c = alloc_conn();
-
-  // Parse target: [secure=? [%tag addr port]]
+// Parse a target [secure=? [%tag addr port]] into a host and a port.
+// Returns NULL, or the message for the %error gift.
+static const char*
+read_target(ur_root_t *r, ur_nref target_ref, int *secure,
+            char *host, size_t host_len, uint64_t *port)
+{
   ur_nref secure_ref, fief_ref;
   if ( read_cell(r, target_ref, &secure_ref, &fief_ref) < 0 ) {
-    send_error(r, lick_fd, wire, "bad target");
-    free(wire);
-    return;
+    return "bad target";
   }
 
-  int secure = (read_atom(secure_ref) == 0) ? 1 : 0;  // 0=yes, 1=no in loobean
+  uint64_t loob;
+  if ( read_atom(r, secure_ref, &loob) < 0 || loob > 1 ) return "bad target";
+  *secure = (loob == 0) ? 1 : 0;  // 0=yes, 1=no in loobean
 
   // Parse fief: [%tag p q]
   ur_nref tag_ref, rest;
-  if ( read_cell(r, fief_ref, &tag_ref, &rest) < 0 ) {
-    send_error(r, lick_fd, wire, "bad fief");
+  if ( read_cell(r, fief_ref, &tag_ref, &rest) < 0 ) return "bad fief";
+
+  ur_nref addr_ref, port_ref;
+  if ( read_cell(r, rest, &addr_ref, &port_ref) < 0 ) return "bad fief";
+
+  char *tag = read_cord(r, tag_ref);
+  const char *err = NULL;
+
+  if ( strcmp(tag, "turf") == 0 ) {
+    // Use the first turf: [%com %example ~] -> "example.com"
+    ur_nref turf_ref, t;
+    if ( read_cell(r, addr_ref, &turf_ref, &t) < 0 ) {
+      err = "empty turf list";
+    }
+    else {
+      char *segs[32];
+      int nseg = 0;
+      size_t need = 0;
+      ur_nref cur = turf_ref;
+      while ( ur_nref_tag(cur) == ur_icell && nseg < 32 ) {
+        ur_nref h;
+        read_cell(r, cur, &h, &cur);
+        segs[nseg] = read_cord(r, h);
+        need += strlen(segs[nseg]) + 1;
+        nseg++;
+      }
+
+      if ( nseg == 0 || ur_nref_tag(cur) == ur_icell || need > host_len ) {
+        err = "bad address";
+      }
+      else {
+        size_t pos = 0;
+        for ( int i = nseg - 1; i >= 0; i-- ) {
+          if ( pos > 0 ) host[pos++] = '.';
+          size_t slen = strlen(segs[i]);
+          memcpy(host + pos, segs[i], slen);
+          pos += slen;
+        }
+        host[pos] = '\0';
+      }
+      for ( int i = 0; i < nseg; i++ ) free(segs[i]);
+    }
+  }
+  else if ( strcmp(tag, "if") == 0 ) {
+    uint64_t ip;
+    if ( read_atom(r, addr_ref, &ip) < 0 || ip > 0xffffffffULL ) {
+      err = "bad address";
+    }
+    else {
+      snprintf(host, host_len, "%llu.%llu.%llu.%llu",
+        (unsigned long long)((ip >> 24) & 0xff),
+        (unsigned long long)((ip >> 16) & 0xff),
+        (unsigned long long)((ip >> 8) & 0xff),
+        (unsigned long long)(ip & 0xff));
+    }
+  }
+  else if ( strcmp(tag, "is") == 0 ) {
+    size_t raw_len = 0;
+    uint8_t *raw = read_bytes(r, addr_ref, &raw_len);
+    if ( ur_nref_tag(addr_ref) == ur_icell || raw_len > 16 ) {
+      err = "bad address";
+    }
+    else {
+      uint8_t ip6[16] = {0};
+      if ( raw_len ) memcpy(ip6, raw, raw_len);
+      snprintf(host, host_len,
+        "%02x%02x:%02x%02x:%02x%02x:%02x%02x:"
+        "%02x%02x:%02x%02x:%02x%02x:%02x%02x",
+        ip6[15], ip6[14], ip6[13], ip6[12],
+        ip6[11], ip6[10], ip6[9],  ip6[8],
+        ip6[7],  ip6[6],  ip6[5],  ip6[4],
+        ip6[3],  ip6[2],  ip6[1],  ip6[0]);
+    }
+    free(raw);
+  }
+  else {
+    err = "unsupported fief type";
+  }
+  free(tag);
+
+  if ( !err && read_port(r, port_ref, port) < 0 ) err = "bad port";
+  return err;
+}
+
+static void
+handle_connect(ur_root_t *r, int lick_fd, ur_nref wire_ref, ur_nref rest)
+{
+  char *wire = task_wire(r, lick_fd, wire_ref);
+  if ( !wire ) return;
+  printf("[%s] task %%connect\n", wire);
+
+  conn_t *old = find_conn(wire);
+  if ( old ) {
+    // The agent drops a wire on %error, so drop the connection too
+    send_error(r, lick_fd, wire, "connection already exists");
+    close_conn(old);
     free(wire);
     return;
   }
 
-  char *tag = read_cord(r, tag_ref);
+  // Detect new format [wire [target timeout]] vs old [wire target]
+  // Old: rest = [secure fief] — head is atom (loobean)
+  // New: rest = [[secure fief] timeout] — head is cell
+  ur_nref head, tail;
+  ur_nref target_ref = rest;
+  uint64_t timeout_ms = 30000;
+
+  if ( read_cell(r, rest, &head, &tail) == 0
+       && ur_nref_tag(head) == ur_icell ) {
+    target_ref = head;
+
+    // timeout is a (unit @ud): ~ or [~ ms]
+    ur_nref u_tag, u_val;
+    if ( read_cell(r, tail, &u_tag, &u_val) == 0 ) {
+      uint64_t v;
+      if ( read_atom(r, u_val, &v) < 0 || v > TIMEOUT_MAX ) {
+        send_error(r, lick_fd, wire, "bad timeout");
+        free(wire);
+        return;
+      }
+      if ( v > 0 ) timeout_ms = v;
+    }
+  }
+
+  int secure = 0;
   char host[256] = {0};
   uint64_t port = 0;
 
-  if ( strcmp(tag, "turf") == 0 ) {
-    ur_nref turfs_ref, port_ref;
-    if ( read_cell(r, rest, &turfs_ref, &port_ref) < 0 ) {
-      send_error(r, lick_fd, wire, "bad turf fief");
-      free(tag); free(wire);
-      return;
-    }
-    port = read_atom(port_ref);
-
-    ur_nref turf_ref;
-    if ( ur_nref_tag(turfs_ref) == ur_icell ) {
-      ur_nref h, t;
-      read_cell(r, turfs_ref, &h, &t);
-      turf_ref = h;
-    } else {
-      send_error(r, lick_fd, wire, "empty turf list");
-      free(tag); free(wire);
-      return;
-    }
-
-    char *segs[32];
-    int nseg = 0;
-    ur_nref cur = turf_ref;
-    while ( ur_nref_tag(cur) == ur_icell ) {
-      ur_nref h, t;
-      read_cell(r, cur, &h, &t);
-      segs[nseg++] = read_cord(r, h);
-      cur = t;
-    }
-
-    size_t pos = 0;
-    for ( int i = nseg - 1; i >= 0; i-- ) {
-      if ( pos > 0 ) host[pos++] = '.';
-      size_t slen = strlen(segs[i]);
-      memcpy(host + pos, segs[i], slen);
-      pos += slen;
-      free(segs[i]);
-    }
-    host[pos] = '\0';
-  }
-  else if ( strcmp(tag, "if") == 0 ) {
-    ur_nref ip_ref, port_ref;
-    if ( read_cell(r, rest, &ip_ref, &port_ref) < 0 ) {
-      send_error(r, lick_fd, wire, "bad if fief");
-      free(tag); free(wire);
-      return;
-    }
-    uint64_t ip = read_atom(ip_ref);
-    port = read_atom(port_ref);
-    snprintf(host, sizeof(host), "%llu.%llu.%llu.%llu",
-      (ip >> 24) & 0xff, (ip >> 16) & 0xff, (ip >> 8) & 0xff, ip & 0xff);
-  }
-  else if ( strcmp(tag, "is") == 0 ) {
-    ur_nref ip_ref, port_ref;
-    if ( read_cell(r, rest, &ip_ref, &port_ref) < 0 ) {
-      send_error(r, lick_fd, wire, "bad is fief");
-      free(tag); free(wire);
-      return;
-    }
-    port = read_atom(port_ref);
-    size_t raw_len;
-    uint8_t *raw = read_bytes(r, ip_ref, &raw_len);
-    uint8_t ip6[16] = {0};
-    if ( raw ) {
-      memcpy(ip6, raw, raw_len < 16 ? raw_len : 16);
-      free(raw);
-    }
-    snprintf(host, sizeof(host),
-      "%02x%02x:%02x%02x:%02x%02x:%02x%02x:"
-      "%02x%02x:%02x%02x:%02x%02x:%02x%02x",
-      ip6[15], ip6[14], ip6[13], ip6[12],
-      ip6[11], ip6[10], ip6[9],  ip6[8],
-      ip6[7],  ip6[6],  ip6[5],  ip6[4],
-      ip6[3],  ip6[2],  ip6[1],  ip6[0]);
-  }
-  else {
-    send_error(r, lick_fd, wire, "unsupported fief type");
-    free(tag); free(wire);
+  const char *bad = read_target(r, target_ref, &secure, host, sizeof(host),
+                                &port);
+  if ( bad ) {
+    send_error(r, lick_fd, wire, bad);
+    free(wire);
     return;
   }
-  free(tag);
 
   printf("[%s] resolving %s:%llu %s (timeout %llums)\n", wire, host,
     (unsigned long long)port, secure ? "(tls)" : "(plain)",
@@ -490,6 +742,7 @@ handle_connect(ur_root_t *r, int lick_fd, ur_nref wire_ref, ur_nref target_ref,
   int ret = connect(sock, res->ai_addr, res->ai_addrlen);
   freeaddrinfo(res);
 
+  conn_t *c = alloc_conn();
   memset(c, 0, sizeof(*c));
   c->active = 1;
   c->sock = sock;
@@ -530,17 +783,25 @@ handle_connect(ur_root_t *r, int lick_fd, ur_nref wire_ref, ur_nref target_ref,
 static void
 handle_send(ur_root_t *r, int lick_fd, ur_nref wire_ref, ur_nref octs_ref)
 {
-  char *wire = read_wire(r, wire_ref);
+  char *wire = task_wire(r, lick_fd, wire_ref);
+  if ( !wire ) return;
+
+  conn_t *c = find_conn(wire);
 
   // octs: [p=@ud q=@]
   ur_nref len_ref, data_ref;
-  if ( read_cell(r, octs_ref, &len_ref, &data_ref) < 0 ) {
+  uint64_t len;
+  if ( read_cell(r, octs_ref, &len_ref, &data_ref) < 0
+       || read_atom(r, len_ref, &len) < 0
+       || len > SEND_MAX
+       || ur_nref_tag(data_ref) == ur_icell ) {
+    // The agent drops a wire on %error, so drop the connection too
     send_error(r, lick_fd, wire, "bad octs");
+    if ( c ) close_conn(c);
     free(wire);
     return;
   }
 
-  uint64_t len = read_atom(len_ref);
   size_t raw_len;
   uint8_t *data = read_bytes(r, data_ref, &raw_len);
 
@@ -551,7 +812,6 @@ handle_send(ur_root_t *r, int lick_fd, ur_nref wire_ref, ur_nref octs_ref)
   }
   printf("[%s] task %%send %llu bytes\n", wire, (unsigned long long)len);
 
-  conn_t *c = find_conn(wire);
   if ( !c ) {
     send_error(r, lick_fd, wire, "no such connection");
     free(data);
@@ -559,18 +819,18 @@ handle_send(ur_root_t *r, int lick_fd, ur_nref wire_ref, ur_nref octs_ref)
     return;
   }
 
-  ssize_t sent;
-  if ( c->ssl ) {
-    sent = SSL_write(c->ssl, data, (int)len);
-  } else {
-    sent = write(c->sock, data, (size_t)len);
+  // Queue behind whatever is still unsent, so the bytes keep their order.
+  // A connection still connecting holds its output until it is up.
+  if ( conn_queue(c, data, (size_t)len) < 0 ) {
+    send_error(r, lick_fd, wire, "send buffer full");
+    close_conn(c);
   }
-
-  if ( sent <= 0 ) {
+  else if ( c->state == CONN_ACTIVE && conn_flush(c) < 0 ) {
     send_error(r, lick_fd, wire, "send failed");
     close_conn(c);
-  } else {
-    printf("[%s] sent %zd/%llu bytes\n", wire, sent, (unsigned long long)len);
+  }
+  else if ( conn_pending(c) ) {
+    printf("[%s] %zu bytes buffered\n", wire, conn_pending(c));
   }
 
   free(data);
@@ -580,17 +840,70 @@ handle_send(ur_root_t *r, int lick_fd, ur_nref wire_ref, ur_nref octs_ref)
 static void
 handle_close(ur_root_t *r, int lick_fd, ur_nref wire_ref)
 {
-  char *wire = read_wire(r, wire_ref);
+  char *wire = task_wire(r, lick_fd, wire_ref);
+  if ( !wire ) return;
   printf("[%s] task %%close\n", wire);
   conn_t *c = find_conn(wire);
 
   if ( c ) {
-    close_conn(c);
+    if ( c->state == CONN_ACTIVE && conn_pending(c) ) {
+      // Unsent output: keep the socket until it drains. The wire is free
+      // at once: no real wire is empty, so nothing finds this connection.
+      printf("[%s] closing after %zu buffered bytes\n", wire,
+             conn_pending(c));
+      c->closing = 1;
+      c->in_more = 0;
+      c->wire[0] = '\0';
+      c->deadline_ms = now_ms() + DRAIN_MS;
+    } else {
+      close_conn(c);
+    }
     send_closed(r, lick_fd, wire);
     printf("[%s] gift %%closed\n", wire);
   }
 
   free(wire);
+}
+
+// --- Lick connection ---
+
+// Connect to vere's Lick socket. Tries once a second until vere is there.
+static int
+lick_connect(const struct sockaddr_un *addr)
+{
+  int waiting = 0;
+
+  while ( 1 ) {
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if ( fd < 0 ) { perror("socket"); exit(1); }
+
+    if ( connect(fd, (struct sockaddr*)addr, sizeof(*addr)) == 0 ) {
+      printf("lick: connected\n");
+      return fd;
+    }
+    if ( !waiting ) {
+      printf("lick: connect: %s; trying again every second\n",
+             strerror(errno));
+      waiting = 1;
+    }
+    close(fd);
+    sleep(1);
+  }
+}
+
+// Vere went away. Close every connection, then wait for vere to return.
+// No gifts go out: nothing is left to read them, and the agent closes
+// its own wires when it hears %disconnect.
+static int
+lick_reconnect(int lick_fd, const struct sockaddr_un *addr)
+{
+  size_t n = 0;
+  for ( size_t i = 0; i < conns_len; i++ ) {
+    if ( conns[i].active ) { close_conn(&conns[i]); n++; }
+  }
+  printf("lick: connection closed; dropped %zu connections\n", n);
+  close(lick_fd);
+  return lick_connect(addr);
 }
 
 // --- Main loop ---
@@ -617,6 +930,9 @@ main(int argc, char **argv)
   ssl_ctx = SSL_CTX_new(TLS_client_method());
   SSL_CTX_set_default_verify_paths(ssl_ctx);
   SSL_CTX_set_verify(ssl_ctx, SSL_VERIFY_PEER, NULL);
+  // SSL_write may take part of a buffer, and conn_queue may move it
+  SSL_CTX_set_mode(ssl_ctx, SSL_MODE_ENABLE_PARTIAL_WRITE
+                          | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
 
   conns = NULL;
   conns_cap = 0;
@@ -626,19 +942,19 @@ main(int argc, char **argv)
   char sock_path[4096];
   snprintf(sock_path, sizeof(sock_path), "%s/.urb/dev/tcp/tcp", argv[1]);
 
-  int lick_fd = socket(AF_UNIX, SOCK_STREAM, 0);
-  if ( lick_fd < 0 ) { perror("socket"); return 1; }
-
   struct sockaddr_un addr = {0};
   addr.sun_family = AF_UNIX;
+  if ( strlen(sock_path) >= sizeof(addr.sun_path) ) {
+    // A truncated path would never connect, and the retry would hide it
+    fprintf(stderr, "socket path too long: %s\n"
+                    "run from inside the pier: cd <pier-path> && %s .\n",
+                    sock_path, argv[0]);
+    return 1;
+  }
   strncpy(addr.sun_path, sock_path, sizeof(addr.sun_path) - 1);
 
   printf("lick: connecting to %s\n", sock_path);
-  if ( connect(lick_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0 ) {
-    perror("connect");
-    return 1;
-  }
-  printf("lick: connected\n");
+  int lick_fd = lick_connect(&addr);
 
   ur_root_t *r = ur_root_init();
 
@@ -650,11 +966,20 @@ main(int argc, char **argv)
     uint64_t ts = now_ms();
     for ( size_t i = 0; i < conns_len; i++ ) {
       conn_t *c = &conns[i];
-      if ( !c->active || c->state == CONN_ACTIVE ) continue;
+      if ( !c->active ) continue;
+      if ( c->closing ) {
+        if ( ts >= c->deadline_ms ) {
+          printf("closed connection dropped %zu unsent bytes\n",
+                 conn_pending(c));
+          close_conn(c);
+        }
+        continue;
+      }
+      if ( c->state == CONN_ACTIVE ) continue;
       if ( ts >= c->deadline_ms ) {
         printf("[%s] timeout (%s)\n", c->wire,
           c->state == CONN_CONNECTING ? "connect" : "tls");
-        char wire_copy[256];
+        char wire_copy[WIRE_MAX];
         strncpy(wire_copy, c->wire, sizeof(wire_copy));
         close_conn(c);
         send_error(r, lick_fd, wire_copy, "connect timeout");
@@ -673,19 +998,26 @@ main(int argc, char **argv)
     pfds[nfds].events = POLLIN;
     nfds++;
 
+    int wait_ms = 100;
+
     for ( size_t i = 0; i < conns_len; i++ ) {
       if ( !conns[i].active ) continue;
       conn_pfd_map[nfds - 1] = i;
+      if ( conns[i].in_more ) wait_ms = 0;
       pfds[nfds].fd = conns[i].sock;
       switch ( conns[i].state ) {
         case CONN_CONNECTING:  pfds[nfds].events = POLLOUT; break;
         case CONN_HANDSHAKING: pfds[nfds].events = POLLIN | POLLOUT; break;
-        case CONN_ACTIVE:      pfds[nfds].events = POLLIN; break;
+        case CONN_ACTIVE:
+          // Unsent output waits for the socket to take more, or for TLS
+          // to read first. A closing connection reads nothing else.
+          pfds[nfds].events = c_events(&conns[i]);
+          break;
       }
       nfds++;
     }
 
-    int ready = poll(pfds, nfds, 100);
+    int ready = poll(pfds, nfds, wait_ms);
     if ( ready < 0 ) {
       if ( errno == EINTR ) goto next;
       perror("poll");
@@ -696,10 +1028,10 @@ main(int argc, char **argv)
 
     // Handle connection events
     for ( int p = 1; p < nfds; p++ ) {
-      if ( !pfds[p].revents ) continue;
-
       size_t ci = conn_pfd_map[p - 1];
       conn_t *c = &conns[ci];
+
+      if ( !pfds[p].revents && !c->in_more ) continue;
 
       // TCP connect completing
       if ( c->state == CONN_CONNECTING ) {
@@ -710,7 +1042,7 @@ main(int argc, char **argv)
           if ( err != 0 ) {
             char msg[256];
             snprintf(msg, sizeof(msg), "connect: %s", strerror(err));
-            char wire_copy[256];
+            char wire_copy[WIRE_MAX];
             strncpy(wire_copy, c->wire, sizeof(wire_copy));
             close_conn(c);
             send_error(r, lick_fd, wire_copy, msg);
@@ -748,7 +1080,7 @@ main(int argc, char **argv)
         } else {
           int err = SSL_get_error(c->ssl, ret);
           if ( err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE ) {
-            char wire_copy[256];
+            char wire_copy[WIRE_MAX];
             strncpy(wire_copy, c->wire, sizeof(wire_copy));
             close_conn(c);
             send_error(r, lick_fd, wire_copy, "tls handshake failed");
@@ -759,51 +1091,47 @@ main(int argc, char **argv)
         continue;
       }
 
+      // Closed by the agent — flush, then drop the socket
+      if ( c->closing ) {
+        if ( conn_flush(c) < 0 || !conn_pending(c) ) close_conn(c);
+        continue;
+      }
+
       // Active connection — handle incoming data
-      if ( !(pfds[p].revents & (POLLIN | POLLHUP | POLLERR)) ) continue;
+      if ( c->in_more || (pfds[p].revents & (POLLIN | POLLHUP | POLLERR)) ) {
+        size_t got = conn_read(c);
 
-      uint8_t buf[8192];
-      ssize_t n;
+        if ( got ) {
+          printf("[%s] gift %%receive %zu bytes\n", c->wire, got);
+          send_receive(r, lick_fd, c->wire, recv_buf, got);
+        }
+        if ( !c->active ) {
+          printf("[%s] remote closed -> gift %%closed\n", c->wire);
+          send_closed(r, lick_fd, c->wire);
+        }
 
-      if ( c->ssl ) {
-        n = SSL_read(c->ssl, buf, sizeof(buf));
-        if ( n <= 0 ) {
-          int err = SSL_get_error(c->ssl, n);
-          if ( err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE ) {
-            continue;
-          }
-        }
-      } else {
-        n = read(c->sock, buf, sizeof(buf));
-        if ( n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) ) {
-          continue;
-        }
+        ur_root_free(r);
+        r = ur_root_init();
       }
 
-      if ( n > 0 ) {
-        printf("[%s] gift %%receive %zd bytes\n", c->wire, n);
-        send_receive(r, lick_fd, c->wire, buf, n);
-      }
-      else {
-        printf("[%s] remote closed -> gift %%closed\n", c->wire);
-        char wire_copy[256];
+      // Still open — send buffered output. After the read, so a peer
+      // that closed gets %closed, not a failed send.
+      if ( c->active && conn_pending(c) && conn_flush(c) < 0 ) {
+        char wire_copy[WIRE_MAX];
         strncpy(wire_copy, c->wire, sizeof(wire_copy));
         close_conn(c);
-        send_closed(r, lick_fd, wire_copy);
+        send_error(r, lick_fd, wire_copy, "send failed");
+        ur_root_free(r);
+        r = ur_root_init();
       }
-
-      ur_root_free(r);
-      r = ur_root_init();
     }
 
     // Check for messages from Lick
-    if ( pfds[0].revents & POLLIN ) {
+    if ( pfds[0].revents & (POLLIN | POLLHUP | POLLERR) ) {
       uint8_t hdr[5];
       if ( read_exact(lick_fd, hdr, 5) < 0 ) {
-        printf("lick: connection closed\n");
-        free(pfds);
-        free(conn_pfd_map);
-        break;
+        lick_fd = lick_reconnect(lick_fd, &addr);
+        goto next;
       }
 
       uint32_t jam_len =
@@ -814,11 +1142,9 @@ main(int argc, char **argv)
 
       uint8_t *jam_byt = malloc(jam_len);
       if ( read_exact(lick_fd, jam_byt, jam_len) < 0 ) {
-        printf("lick: read failed\n");
         free(jam_byt);
-        free(pfds);
-        free(conn_pfd_map);
-        break;
+        lick_fd = lick_reconnect(lick_fd, &addr);
+        goto next;
       }
 
       ur_nref noun;
@@ -850,30 +1176,7 @@ main(int argc, char **argv)
       if ( strcmp(cmd, "connect") == 0 ) {
         ur_nref wire_ref, rest;
         if ( read_cell(r, cmd_rest, &wire_ref, &rest) == 0 ) {
-          // Detect new format [wire [target timeout]] vs old [wire target]
-          // Old: rest = [secure fief] — head is atom (loobean)
-          // New: rest = [[secure fief] timeout] — head is cell
-          ur_nref head, tail;
-          uint64_t timeout_ms = 30000;
-          ur_nref target_ref;
-
-          if ( read_cell(r, rest, &head, &tail) == 0
-               && ur_nref_tag(head) == ur_icell ) {
-            // New format
-            target_ref = head;
-            if ( ur_nref_tag(tail) == ur_icell ) {
-              ur_nref u_tag, u_val;
-              if ( read_cell(r, tail, &u_tag, &u_val) == 0 ) {
-                uint64_t v = read_atom(u_val);
-                if ( v > 0 ) timeout_ms = v;
-              }
-            }
-          } else {
-            // Old format — rest is the target directly
-            target_ref = rest;
-          }
-
-          handle_connect(r, lick_fd, wire_ref, target_ref, timeout_ms);
+          handle_connect(r, lick_fd, wire_ref, rest);
         }
       }
       else if ( strcmp(cmd, "send") == 0 ) {

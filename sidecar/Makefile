@@ -12,7 +12,7 @@ $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 clean:
-	rm -f $(OBJS) $(TARGET) stress-test stress-test.o
+	rm -f $(OBJS) $(TARGET) stress-test stress-test.o test-sidecar test.o
 
 asan: clean
 	$(MAKE) CFLAGS="-Wall -Wextra -O0 -g -fsanitize=address -I. $(shell pkg-config --cflags openssl 2>/dev/null)" LDFLAGS="-fsanitize=address $(shell pkg-config --libs openssl 2>/dev/null || echo '-lssl -lcrypto')"
@@ -20,4 +20,10 @@ asan: clean
 stress-test: stress-test.o ur/hashcons.o ur/bitstream.o ur/serial.o ur/murmur3.o
 	$(CC) $(CFLAGS) -o $@ $^
 
-.PHONY: clean asan
+test-sidecar: test.o ur/hashcons.o ur/bitstream.o ur/serial.o ur/murmur3.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
+test: $(TARGET) test-sidecar
+	./test-sidecar
+
+.PHONY: clean asan test
