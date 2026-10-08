@@ -98,11 +98,27 @@ read_bytes(ur_root_t *r, ur_nref ref, size_t *out_len)
   return NULL;
 }
 
-static uint64_t
-read_atom(ur_nref ref)
+// Read an atom of at most 64 bits. Returns -1 for a cell or a wider atom.
+static int
+read_atom(ur_root_t *r, ur_nref ref, uint64_t *out)
 {
-  if ( ur_nref_tag(ref) == ur_direct ) return ur_nref_idx(ref);
-  return 0;
+  if ( ur_nref_tag(ref) == ur_direct ) {
+    *out = ur_nref_idx(ref);
+    return 0;
+  }
+  if ( ur_nref_tag(ref) == ur_iatom ) {
+    uint64_t idx = ur_nref_idx(ref);
+    uint64_t len = r->atoms.lens[idx];
+    uint8_t *byt = r->atoms.bytes[idx];
+    if ( len > 8 ) return -1;
+    uint64_t val = 0;
+    for ( uint64_t i = 0; i < len; i++ ) {
+      val |= (uint64_t)byt[i] << (8 * i);
+    }
+    *out = val;
+    return 0;
+  }
+  return -1;
 }
 
 static int
@@ -337,9 +353,124 @@ set_nonblock(int fd)
 
 // --- Handle commands from the agent ---
 
+// Largest %send, in bytes
+#define SEND_MAX (64u << 20)
+
+// Longest connect timeout, in milliseconds
+#define TIMEOUT_MAX 0xffffffffULL
+
+// Read a port. Returns -1 unless it is an atom from 1 to 65535.
+static int
+read_port(ur_root_t *r, ur_nref ref, uint64_t *port)
+{
+  if ( read_atom(r, ref, port) < 0 ) return -1;
+  if ( *port == 0 || *port > 65535 ) return -1;
+  return 0;
+}
+
+// Parse a target [secure=? [%tag addr port]] into a host and a port.
+// Returns NULL, or the message for the %error gift.
+static const char*
+read_target(ur_root_t *r, ur_nref target_ref, int *secure,
+            char *host, size_t host_len, uint64_t *port)
+{
+  ur_nref secure_ref, fief_ref;
+  if ( read_cell(r, target_ref, &secure_ref, &fief_ref) < 0 ) {
+    return "bad target";
+  }
+
+  uint64_t loob;
+  if ( read_atom(r, secure_ref, &loob) < 0 || loob > 1 ) return "bad target";
+  *secure = (loob == 0) ? 1 : 0;  // 0=yes, 1=no in loobean
+
+  // Parse fief: [%tag p q]
+  ur_nref tag_ref, rest;
+  if ( read_cell(r, fief_ref, &tag_ref, &rest) < 0 ) return "bad fief";
+
+  ur_nref addr_ref, port_ref;
+  if ( read_cell(r, rest, &addr_ref, &port_ref) < 0 ) return "bad fief";
+
+  char *tag = read_cord(r, tag_ref);
+  const char *err = NULL;
+
+  if ( strcmp(tag, "turf") == 0 ) {
+    // Use the first turf: [%com %example ~] -> "example.com"
+    ur_nref turf_ref, t;
+    if ( read_cell(r, addr_ref, &turf_ref, &t) < 0 ) {
+      err = "empty turf list";
+    }
+    else {
+      char *segs[32];
+      int nseg = 0;
+      size_t need = 0;
+      ur_nref cur = turf_ref;
+      while ( ur_nref_tag(cur) == ur_icell && nseg < 32 ) {
+        ur_nref h;
+        read_cell(r, cur, &h, &cur);
+        segs[nseg] = read_cord(r, h);
+        need += strlen(segs[nseg]) + 1;
+        nseg++;
+      }
+
+      if ( nseg == 0 || ur_nref_tag(cur) == ur_icell || need > host_len ) {
+        err = "bad address";
+      }
+      else {
+        size_t pos = 0;
+        for ( int i = nseg - 1; i >= 0; i-- ) {
+          if ( pos > 0 ) host[pos++] = '.';
+          size_t slen = strlen(segs[i]);
+          memcpy(host + pos, segs[i], slen);
+          pos += slen;
+        }
+        host[pos] = '\0';
+      }
+      for ( int i = 0; i < nseg; i++ ) free(segs[i]);
+    }
+  }
+  else if ( strcmp(tag, "if") == 0 ) {
+    uint64_t ip;
+    if ( read_atom(r, addr_ref, &ip) < 0 || ip > 0xffffffffULL ) {
+      err = "bad address";
+    }
+    else {
+      snprintf(host, host_len, "%llu.%llu.%llu.%llu",
+        (unsigned long long)((ip >> 24) & 0xff),
+        (unsigned long long)((ip >> 16) & 0xff),
+        (unsigned long long)((ip >> 8) & 0xff),
+        (unsigned long long)(ip & 0xff));
+    }
+  }
+  else if ( strcmp(tag, "is") == 0 ) {
+    size_t raw_len = 0;
+    uint8_t *raw = read_bytes(r, addr_ref, &raw_len);
+    if ( ur_nref_tag(addr_ref) == ur_icell || raw_len > 16 ) {
+      err = "bad address";
+    }
+    else {
+      uint8_t ip6[16] = {0};
+      if ( raw_len ) memcpy(ip6, raw, raw_len);
+      snprintf(host, host_len,
+        "%02x%02x:%02x%02x:%02x%02x:%02x%02x:"
+        "%02x%02x:%02x%02x:%02x%02x:%02x%02x",
+        ip6[15], ip6[14], ip6[13], ip6[12],
+        ip6[11], ip6[10], ip6[9],  ip6[8],
+        ip6[7],  ip6[6],  ip6[5],  ip6[4],
+        ip6[3],  ip6[2],  ip6[1],  ip6[0]);
+    }
+    free(raw);
+  }
+  else {
+    err = "unsupported fief type";
+  }
+  free(tag);
+
+  if ( !err && read_port(r, port_ref, port) < 0 ) err = "bad port";
+  return err;
+}
+
 static void
-handle_connect(ur_root_t *r, int lick_fd, ur_nref wire_ref, ur_nref target_ref,
-               uint64_t timeout_ms)
+handle_connect(ur_root_t *r, int lick_fd, ur_nref wire_ref, ur_nref rest)
 {
   char *wire = read_wire(r, wire_ref);
   printf("[%s] task %%connect\n", wire);
@@ -350,111 +481,41 @@ handle_connect(ur_root_t *r, int lick_fd, ur_nref wire_ref, ur_nref target_ref,
     return;
   }
 
-  conn_t *c = alloc_conn();
+  // Detect new format [wire [target timeout]] vs old [wire target]
+  // Old: rest = [secure fief] — head is atom (loobean)
+  // New: rest = [[secure fief] timeout] — head is cell
+  ur_nref head, tail;
+  ur_nref target_ref = rest;
+  uint64_t timeout_ms = 30000;
 
-  // Parse target: [secure=? [%tag addr port]]
-  ur_nref secure_ref, fief_ref;
-  if ( read_cell(r, target_ref, &secure_ref, &fief_ref) < 0 ) {
-    send_error(r, lick_fd, wire, "bad target");
-    free(wire);
-    return;
+  if ( read_cell(r, rest, &head, &tail) == 0
+       && ur_nref_tag(head) == ur_icell ) {
+    target_ref = head;
+
+    // timeout is a (unit @ud): ~ or [~ ms]
+    ur_nref u_tag, u_val;
+    if ( read_cell(r, tail, &u_tag, &u_val) == 0 ) {
+      uint64_t v;
+      if ( read_atom(r, u_val, &v) < 0 || v > TIMEOUT_MAX ) {
+        send_error(r, lick_fd, wire, "bad timeout");
+        free(wire);
+        return;
+      }
+      if ( v > 0 ) timeout_ms = v;
+    }
   }
 
-  int secure = (read_atom(secure_ref) == 0) ? 1 : 0;  // 0=yes, 1=no in loobean
-
-  // Parse fief: [%tag p q]
-  ur_nref tag_ref, rest;
-  if ( read_cell(r, fief_ref, &tag_ref, &rest) < 0 ) {
-    send_error(r, lick_fd, wire, "bad fief");
-    free(wire);
-    return;
-  }
-
-  char *tag = read_cord(r, tag_ref);
+  int secure = 0;
   char host[256] = {0};
   uint64_t port = 0;
 
-  if ( strcmp(tag, "turf") == 0 ) {
-    ur_nref turfs_ref, port_ref;
-    if ( read_cell(r, rest, &turfs_ref, &port_ref) < 0 ) {
-      send_error(r, lick_fd, wire, "bad turf fief");
-      free(tag); free(wire);
-      return;
-    }
-    port = read_atom(port_ref);
-
-    ur_nref turf_ref;
-    if ( ur_nref_tag(turfs_ref) == ur_icell ) {
-      ur_nref h, t;
-      read_cell(r, turfs_ref, &h, &t);
-      turf_ref = h;
-    } else {
-      send_error(r, lick_fd, wire, "empty turf list");
-      free(tag); free(wire);
-      return;
-    }
-
-    char *segs[32];
-    int nseg = 0;
-    ur_nref cur = turf_ref;
-    while ( ur_nref_tag(cur) == ur_icell ) {
-      ur_nref h, t;
-      read_cell(r, cur, &h, &t);
-      segs[nseg++] = read_cord(r, h);
-      cur = t;
-    }
-
-    size_t pos = 0;
-    for ( int i = nseg - 1; i >= 0; i-- ) {
-      if ( pos > 0 ) host[pos++] = '.';
-      size_t slen = strlen(segs[i]);
-      memcpy(host + pos, segs[i], slen);
-      pos += slen;
-      free(segs[i]);
-    }
-    host[pos] = '\0';
-  }
-  else if ( strcmp(tag, "if") == 0 ) {
-    ur_nref ip_ref, port_ref;
-    if ( read_cell(r, rest, &ip_ref, &port_ref) < 0 ) {
-      send_error(r, lick_fd, wire, "bad if fief");
-      free(tag); free(wire);
-      return;
-    }
-    uint64_t ip = read_atom(ip_ref);
-    port = read_atom(port_ref);
-    snprintf(host, sizeof(host), "%llu.%llu.%llu.%llu",
-      (ip >> 24) & 0xff, (ip >> 16) & 0xff, (ip >> 8) & 0xff, ip & 0xff);
-  }
-  else if ( strcmp(tag, "is") == 0 ) {
-    ur_nref ip_ref, port_ref;
-    if ( read_cell(r, rest, &ip_ref, &port_ref) < 0 ) {
-      send_error(r, lick_fd, wire, "bad is fief");
-      free(tag); free(wire);
-      return;
-    }
-    port = read_atom(port_ref);
-    size_t raw_len;
-    uint8_t *raw = read_bytes(r, ip_ref, &raw_len);
-    uint8_t ip6[16] = {0};
-    if ( raw ) {
-      memcpy(ip6, raw, raw_len < 16 ? raw_len : 16);
-      free(raw);
-    }
-    snprintf(host, sizeof(host),
-      "%02x%02x:%02x%02x:%02x%02x:%02x%02x:"
-      "%02x%02x:%02x%02x:%02x%02x:%02x%02x",
-      ip6[15], ip6[14], ip6[13], ip6[12],
-      ip6[11], ip6[10], ip6[9],  ip6[8],
-      ip6[7],  ip6[6],  ip6[5],  ip6[4],
-      ip6[3],  ip6[2],  ip6[1],  ip6[0]);
-  }
-  else {
-    send_error(r, lick_fd, wire, "unsupported fief type");
-    free(tag); free(wire);
+  const char *bad = read_target(r, target_ref, &secure, host, sizeof(host),
+                                &port);
+  if ( bad ) {
+    send_error(r, lick_fd, wire, bad);
+    free(wire);
     return;
   }
-  free(tag);
 
   printf("[%s] resolving %s:%llu %s (timeout %llums)\n", wire, host,
     (unsigned long long)port, secure ? "(tls)" : "(plain)",
@@ -490,6 +551,7 @@ handle_connect(ur_root_t *r, int lick_fd, ur_nref wire_ref, ur_nref target_ref,
   int ret = connect(sock, res->ai_addr, res->ai_addrlen);
   freeaddrinfo(res);
 
+  conn_t *c = alloc_conn();
   memset(c, 0, sizeof(*c));
   c->active = 1;
   c->sock = sock;
@@ -532,15 +594,22 @@ handle_send(ur_root_t *r, int lick_fd, ur_nref wire_ref, ur_nref octs_ref)
 {
   char *wire = read_wire(r, wire_ref);
 
+  conn_t *c = find_conn(wire);
+
   // octs: [p=@ud q=@]
   ur_nref len_ref, data_ref;
-  if ( read_cell(r, octs_ref, &len_ref, &data_ref) < 0 ) {
+  uint64_t len;
+  if ( read_cell(r, octs_ref, &len_ref, &data_ref) < 0
+       || read_atom(r, len_ref, &len) < 0
+       || len > SEND_MAX
+       || ur_nref_tag(data_ref) == ur_icell ) {
+    // The agent drops a wire on %error, so drop the connection too
     send_error(r, lick_fd, wire, "bad octs");
+    if ( c ) close_conn(c);
     free(wire);
     return;
   }
 
-  uint64_t len = read_atom(len_ref);
   size_t raw_len;
   uint8_t *data = read_bytes(r, data_ref, &raw_len);
 
@@ -551,7 +620,6 @@ handle_send(ur_root_t *r, int lick_fd, ur_nref wire_ref, ur_nref octs_ref)
   }
   printf("[%s] task %%send %llu bytes\n", wire, (unsigned long long)len);
 
-  conn_t *c = find_conn(wire);
   if ( !c ) {
     send_error(r, lick_fd, wire, "no such connection");
     free(data);
@@ -850,30 +918,7 @@ main(int argc, char **argv)
       if ( strcmp(cmd, "connect") == 0 ) {
         ur_nref wire_ref, rest;
         if ( read_cell(r, cmd_rest, &wire_ref, &rest) == 0 ) {
-          // Detect new format [wire [target timeout]] vs old [wire target]
-          // Old: rest = [secure fief] — head is atom (loobean)
-          // New: rest = [[secure fief] timeout] — head is cell
-          ur_nref head, tail;
-          uint64_t timeout_ms = 30000;
-          ur_nref target_ref;
-
-          if ( read_cell(r, rest, &head, &tail) == 0
-               && ur_nref_tag(head) == ur_icell ) {
-            // New format
-            target_ref = head;
-            if ( ur_nref_tag(tail) == ur_icell ) {
-              ur_nref u_tag, u_val;
-              if ( read_cell(r, tail, &u_tag, &u_val) == 0 ) {
-                uint64_t v = read_atom(u_val);
-                if ( v > 0 ) timeout_ms = v;
-              }
-            }
-          } else {
-            // Old format — rest is the target directly
-            target_ref = rest;
-          }
-
-          handle_connect(r, lick_fd, wire_ref, target_ref, timeout_ms);
+          handle_connect(r, lick_fd, wire_ref, rest);
         }
       }
       else if ( strcmp(cmd, "send") == 0 ) {
